@@ -144,21 +144,145 @@ function execShellStreaming(cmd: string, cwd: string): Promise<{ ok: boolean; ou
 }
 
 // ---------------------------------------------------------------------------
+// Directory scanning
+// ---------------------------------------------------------------------------
+
+const IGNORE_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", ".next", ".cache",
+  "__pycache__", ".vscode", ".idea", "coverage", ".turbo",
+]);
+
+const IGNORE_FILES = new Set([
+  ".DS_Store", "Thumbs.db", ".env", ".env.local",
+]);
+
+function scanDirectory(dir: string, depth: number = 2, prefix: string = ""): string {
+  const lines: string[] = [];
+
+  if (depth < 0) return "";
+
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+    const dirs = entries
+      .filter((e) => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith("."))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const files = entries
+      .filter((e) => e.isFile() && !IGNORE_FILES.has(e.name) && !e.name.startsWith("."))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    const all = [...dirs, ...files];
+
+    all.forEach((entry, i) => {
+      const isLast = i === all.length - 1;
+      const connector = isLast ? "└── " : "├── ";
+      const childPrefix = isLast ? "    " : "│   ";
+
+      if (entry.isDirectory()) {
+        lines.push(`${prefix}${connector}${entry.name}/`);
+        const sub = scanDirectory(path.join(dir, entry.name), depth - 1, prefix + childPrefix);
+        if (sub) lines.push(sub);
+      } else {
+        lines.push(`${prefix}${connector}${entry.name}`);
+      }
+    });
+  } catch {
+    // permission denied or other error
+  }
+
+  return lines.join("\n");
+}
+
+function getDirectoryContext(cwd: string): string {
+  const tree = scanDirectory(cwd);
+  if (!tree) return "(empty directory)";
+  return tree;
+}
+
+// ---------------------------------------------------------------------------
+// Code block rendering with boxes
+// ---------------------------------------------------------------------------
+
+const LANG_LABELS: Record<string, string> = {
+  html: "HTML",
+  css: "CSS",
+  js: "JavaScript",
+  javascript: "JavaScript",
+  ts: "TypeScript",
+  typescript: "TypeScript",
+  py: "Python",
+  python: "Python",
+  json: "JSON",
+  yaml: "YAML",
+  yml: "YAML",
+  md: "Markdown",
+  bash: "Bash",
+  sh: "Shell",
+  shell: "Shell",
+  jsx: "JSX",
+  tsx: "TSX",
+  sql: "SQL",
+  rust: "Rust",
+  go: "Go",
+  java: "Java",
+  c: "C",
+  cpp: "C++",
+  rb: "Ruby",
+  php: "PHP",
+  swift: "Swift",
+  kt: "Kotlin",
+  toml: "TOML",
+  xml: "XML",
+  svg: "SVG",
+};
+
+function renderCodeBox(lang: string, code: string): string {
+  const label = LANG_LABELS[lang.toLowerCase()] || lang.toUpperCase();
+  const lines = code.split("\n");
+  const maxLen = Math.max(label.length + 4, ...lines.map((l) => l.length));
+  const width = Math.min(maxLen + 2, 120);
+
+  const top = `${DIM}┌─ ${label} ${"─".repeat(Math.max(0, width - label.length - 3))}┐${RESET}`;
+  const bottom = `${DIM}└${"─".repeat(width)}┘${RESET}`;
+
+  const body = lines.map((line) => {
+    const padded = line.length > width ? line.slice(0, width - 3) + "..." : line;
+    return `${DIM}│${RESET} ${padded}`;
+  });
+
+  return [top, ...body, bottom].join("\n");
+}
+
+function formatResponse(text: string): string {
+  // Replace ```lang\n...\n``` with boxed versions
+  return text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const trimmed = code.replace(/\n$/, "");
+    return `\n${renderCodeBox(lang || "text", trimmed)}\n`;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
 
-function getSystemPrompt(intensity: Intensity): string {
+function getSystemPrompt(intensity: Intensity, cwd: string): string {
   const descriptions: Record<Intensity, string> = {
     low: "Be transactional. Execute the exact task requested. Optimize for raw completion speed.",
     medium: "Analyze impacted files directly. Verify changes work before resolving.",
     high: "Act as an elite software architect. Deeply scan the file tree, run linting, tests, and optimize across integrations.",
   };
 
+  const dirTree = getDirectoryContext(cwd);
+
   return [
     "You are FLOW CODE, a free open-source terminal coding agent powered by Groq.",
     "",
-    `Current Working Directory: ${process.cwd()}`,
+    `Current Working Directory: ${cwd}`,
     `Processing Intensity: ${intensity.toUpperCase()} — ${descriptions[intensity]}`,
+    "",
+    "Directory Contents:",
+    dirTree,
     "",
     "Rules:",
     "- Always wrap executable bash commands in ```bash code blocks.",
@@ -166,6 +290,7 @@ function getSystemPrompt(intensity: Intensity): string {
     "- Do NOT wrap multiple commands in a single code block unless they are sequential.",
     "- Be concise. Explain only when necessary.",
     "- Never fabricate file contents. Read files first.",
+    "- When generating code, use the appropriate language tag (e.g. ```html, ```css, ```js, ```ts).",
   ].join("\n");
 }
 
@@ -314,7 +439,7 @@ function extractBashBlocks(text: string): string[] {
 
 async function run(client: OpenAI, model: string, intensity: Intensity): Promise<void> {
   const history: Message[] = [
-    { role: "system", content: getSystemPrompt(intensity) },
+    { role: "system", content: getSystemPrompt(intensity, process.cwd()) },
   ];
 
   while (true) {
@@ -336,7 +461,13 @@ async function run(client: OpenAI, model: string, intensity: Intensity): Promise
       const target = path.resolve(input.slice(3).replace(/^['"]|['"]$/g, ""));
       try {
         process.chdir(target);
-        console.log(green(`  ✔ ${process.cwd()}`));
+        const newCwd = process.cwd();
+        console.log(green(`  ✔ ${newCwd}\n`));
+        const tree = getDirectoryContext(newCwd);
+        if (tree) {
+          console.log(dim("  Directory contents:"));
+          console.log(dim(tree) + "\n");
+        }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(red(`  ✘ ${msg}`));
@@ -344,8 +475,8 @@ async function run(client: OpenAI, model: string, intensity: Intensity): Promise
       continue;
     }
 
-    // Update system prompt with current cwd
-    history[0] = { role: "system", content: getSystemPrompt(intensity) };
+    // Update system prompt with current cwd + directory tree
+    history[0] = { role: "system", content: getSystemPrompt(intensity, cwd) };
 
     // Add user message
     history.push({ role: "user", content: input });
@@ -371,12 +502,13 @@ async function run(client: OpenAI, model: string, intensity: Intensity): Promise
 
       if (!reply) {
         console.log(red("  No response from model."));
-        history.pop(); // remove failed user message
+        history.pop();
         continue;
       }
 
-      // Print reply
-      console.log(`\n  ${bold(blue("Flow"))} ${reply}\n`);
+      // Print reply with code boxes
+      console.log(`\n  ${bold(blue("Flow"))}`);
+      console.log(formatResponse(reply) + "\n");
 
       history.push({ role: "assistant", content: reply });
 
@@ -399,14 +531,13 @@ async function run(client: OpenAI, model: string, intensity: Intensity): Promise
       process.stdout.write(" ".repeat(20) + "\r");
       const msg = err instanceof Error ? err.message : String(err);
 
-      // API key error — suggest reconfigure
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
         console.error(red("  ✘ Invalid API key. Delete ~/.flow-code-config and restart."));
       } else {
         console.error(red(`  ✘ ${msg}`));
       }
 
-      history.pop(); // remove failed user message
+      history.pop();
     }
   }
 }
