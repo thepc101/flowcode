@@ -46,6 +46,7 @@ On first run you'll be prompted to:
 | `cd <path>` | Switch working directory (shows file tree) |
 | `/search <query>` | Search the web via DuckDuckGo |
 | `/fetch <url>` | Fetch and display URL content |
+| `/write <file>` | Write a file manually (paste content, end with `---`) |
 | `/settings` | Open interactive settings menu |
 | `/models` | Re-select your model |
 | `/provider` | Switch between Groq and Cerebras (live, no restart) |
@@ -56,6 +57,16 @@ On first run you'll be prompted to:
 | `/status` | Show provider, model, intensity, and token usage |
 | `/help` | List all commands |
 | `exit` | Quit Flow Code |
+
+## Auto-File Writing
+
+Flow Code automatically writes files when the model generates code with filenames:
+
+- Code block with filename as first line: `filename.ext` then ```` ```lang ``
+- "Create/write/save file" instructions followed by code
+- Common filenames like `index.html`, `style.css`, `app.js`
+
+Files are saved to your current working directory with parent directories created automatically.
 
 ## Auto-Search
 
