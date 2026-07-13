@@ -48,7 +48,7 @@ On first run you'll be prompted to:
 | `/fetch <url>` | Fetch and display URL content |
 | `/settings` | Open interactive settings menu |
 | `/models` | Re-select your model |
-| `/provider` | Switch between Groq and Cerebras |
+| `/provider` | Switch between Groq and Cerebras (live, no restart) |
 | `/resume` | Resume last saved conversation |
 | `/compact` | Trim conversation history to fit context |
 | `/clear` | Reset conversation history |
