@@ -1414,7 +1414,8 @@ function main(): void {
       console.log(c.dim(`  Current directory: ${process.cwd()}`));
       const dirInput = await ask(c.bold("  Project directory (Enter to skip): "));
       if (dirInput.trim()) {
-        const target = path.resolve(dirInput.trim());
+        const cleaned = dirInput.trim().replace(/^['"]|['"]$/g, "");
+        const target = path.resolve(cleaned);
         try {
           process.chdir(target);
           console.log(c.green(`  ✔ Switched to: ${process.cwd()}\n`));
