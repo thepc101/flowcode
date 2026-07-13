@@ -372,9 +372,14 @@ function formatSessionAge(ts: number): string {
 
 function printBanner(): void {
   console.clear();
+  const accent = (t: string) => `${BOLD}${CYAN}${t}${RESET}`;
+  const dim = (t: string) => `${DIM}${t}${RESET}`;
+  const spark = (t: string) => `${BOLD}${MAGENTA}${t}${RESET}`;
+
   console.log("");
-  console.log(`  ${c.bold(c.blue("Flow Code"))} ${c.dim(`v${VERSION}`)}`);
-  console.log(c.dim("  Free & Open Source Terminal Coding Agent"));
+  console.log(`  ${spark("(*)")} ${accent("Flow Code")} ${dim("v" + VERSION)}`);
+  console.log(`       ${dim("terminal coding agent")}`);
+  console.log(`       ${dim("--------------------")}`);
   console.log("");
 }
 
@@ -385,39 +390,33 @@ function printDashboard(config: Config): void {
   const cwd = process.cwd();
   const activity = getRecentActivity();
 
-  const w = 60;
-  const hline = c.dim("-".repeat(w));
+  const dim = (t: string) => `${DIM}${t}${RESET}`;
+  const bold = (t: string) => `${BOLD}${t}${RESET}`;
+  const blue = (t: string) => `${CYAN}${t}${RESET}`;
+  const yellow = (t: string) => `${YELLOW}${t}${RESET}`;
+  const w = 48;
+  const line = dim("-".repeat(w));
 
   console.log("");
-  console.log(`  ${c.dim("---")} ${c.bold(c.blue("Flow Code"))} ${c.dim(`v${VERSION}`)} ${c.dim("-".repeat(w - 26))}`);
-  console.log("");
-
-  console.log(`  ${c.bold("Welcome back!")}`);
-  console.log("");
-  console.log(`  ${c.dim("FLOW CODE")}`);
-  console.log("");
-  console.log(`  ${c.dim(`${provider.name} | ${model}`)}`);
-  console.log(`  ${c.dim(cwd)}`);
+  console.log(`  ${dim("---")} ${bold(blue("Flow Code"))} ${dim(`v${VERSION} ${"-".repeat(w - 26)}`)}`);
+  console.log(line);
+  console.log(`  ${dim(`${provider.name} | ${model}`)}`);
+  console.log(`  ${dim(cwd)}`);
 
   if (activity.length > 0) {
     console.log("");
-    console.log(`  ${c.bold(c.yellow("Recent activity"))}`);
+    console.log(`  ${bold(yellow("Recent"))}`);
     for (const entry of activity) {
       const ago = timeAgo(entry.time);
       const action =
-        entry.action.length > 40 ? entry.action.slice(0, 37) + "..." : entry.action;
-      console.log(`  ${c.dim(ago.padEnd(10))} ${action}`);
+        entry.action.length > 38 ? entry.action.slice(0, 35) + "..." : entry.action;
+      console.log(`  ${dim(ago.padEnd(10))} ${action}`);
     }
   }
 
-  console.log("");
-  console.log(`  ${c.bold(c.yellow("What's new"))}`);
-  console.log(`  ${c.dim("/search")} to search the web`);
-  console.log(`  ${c.dim("/resume")} to continue last conversation`);
-  console.log(`  ${c.dim("/cmds")} to see all commands`);
-  console.log(`  ${c.dim("/settings")} to configure preferences`);
-  console.log(`  ${c.dim("Ctrl+C to exit")}`);
-  console.log(hline);
+  console.log(line);
+  console.log(`  ${dim("/cmds")} commands  ${dim("/help")} help  ${dim("exit")} quit`);
+  console.log(line);
   console.log("");
 }
 
@@ -756,7 +755,7 @@ async function setup(): Promise<{
   // Provider selection
   let provider: Provider = config.provider || "groq";
   if (!config.apiKey) {
-    console.log(c.bold("  Select AI Provider:"));
+    console.log(c.bold("  [1/4] Select AI Provider:"));
     console.log(
       `    ${c.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`
     );
@@ -771,7 +770,7 @@ async function setup(): Promise<{
 
   // API key
   if (!config.apiKey) {
-    console.log(c.dim(`\n  Enter your ${providerConfig.name} API Key:`));
+    console.log(c.dim(`\n  [2/4] Enter your ${providerConfig.name} API Key:`));
     const key = await ask("  API Key: ");
     if (!key || key.length < 10) {
       console.error(c.red("  Invalid key. Exiting."));
@@ -795,7 +794,7 @@ async function setup(): Promise<{
   );
 
   try {
-    console.log(c.dim(`  Fetching ${PROVIDERS[provider].name} models...`));
+    console.log(c.dim(`\n  [3/4] Fetching ${PROVIDERS[provider].name} models...`));
     const res = await client.models.list();
     const models = res.data
       .map((m) => m.id)
@@ -803,7 +802,7 @@ async function setup(): Promise<{
       .sort();
 
     if (models.length > 0) {
-      console.log(c.bold("\n  Available Models:"));
+      console.log(c.bold("  Available Models:"));
       models.forEach((m, i) =>
         console.log(`    ${c.dim(`[${i}]`)} ${m}`)
       );
@@ -822,7 +821,7 @@ async function setup(): Promise<{
   }
 
   // Intensity
-  console.log(c.bold("\n  Processing Mode:"));
+  console.log(c.bold("\n  [4/4] Processing Mode:"));
   console.log(`    ${c.dim("[1]")} Low    -- Fast, single-file patches`);
   console.log(`    ${c.dim("[2]")} Medium -- Standard refactoring`);
   console.log(`    ${c.dim("[3]")} High   -- Deep scanning & DevOps`);
@@ -842,17 +841,11 @@ async function setup(): Promise<{
   saveConfig(config);
 
   console.log("");
+  console.log(c.green(`  Setup complete.`));
   console.log(
-    c.green(
-      `  [OK] ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`
-    )
+    c.dim(`  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`)
   );
-  console.log(c.dim(`  Context: ${CONTEXT_WINDOW.toLocaleString()} tokens`));
-  console.log(
-    c.dim(
-      "  Commands: exit, cd, /clear, /compact, /help, /models, /search, /fetch\n"
-    )
-  );
+  console.log("");
 
   return { client, model, intensity, provider };
 }
@@ -1962,7 +1955,7 @@ function main(): void {
 
   setup()
     .then(async ({ client, model, intensity, provider }) => {
-      console.log(c.dim(`  Current directory: ${process.cwd()}`));
+      console.log(c.dim(`  Working directory: ${process.cwd()}`));
       const dirInput = await ask(
         c.bold("  Project directory (Enter to skip): ")
       );
@@ -1974,7 +1967,7 @@ function main(): void {
         try {
           process.chdir(target);
           console.log(
-            c.green(`  [OK] Switched to: ${process.cwd()}\n`)
+            c.green(`  Switched to: ${process.cwd()}\n`)
           );
         } catch {
           console.log(
