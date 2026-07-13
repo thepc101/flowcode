@@ -4,15 +4,15 @@ A lightning-fast, free, terminal-native autonomous coding agent powered by **Gro
 
 ## Features
 
-- **Multi-Provider** — Groq and Cerebras API support
-- **Auto-Search** — Detects when questions need current data and searches the web automatically
-- **Code Box Rendering** — Generated code appears in bordered boxes with language labels
-- **Auto Directory Scan** — Shows file tree when you `cd` into a folder
-- **Streaming Responses** — Real-time token-by-token output
-- **Context Usage Display** — Visual progress bar showing token consumption
-- **Slash Commands** — `/search`, `/fetch`, `/settings`, `/models`, `/compact`, `/clear`, `/status`
-- **128K Context Window** — Full leverage of Groq/Cerebras free API limits
-- **Claude Code Dashboard** — Welcome screen with recent activity and quick tips
+- **Multi-Provider** -- Groq and Cerebras API support with live switching
+- **Auto-File Writing** -- Code blocks with filenames are automatically saved to disk
+- **Auto-Search** -- Detects when questions need current data and searches the web automatically
+- **Streaming Responses** -- Real-time token-by-token output
+- **Context Usage Display** -- Visual progress bar showing token consumption
+- **Session Persistence** -- `/resume` continues your last conversation
+- **128K Context Window** -- Full leverage of Groq/Cerebras free API limits
+- **Code Box Rendering** -- Generated code appears in bordered boxes with language labels
+- **Directory Scanning** -- Shows file tree when you `cd` into a folder
 
 ## Installation
 
@@ -34,10 +34,10 @@ flow-code
 
 On first run you'll be prompted to:
 
-1. **Select a provider** — Groq or Cerebras
-2. **Enter your API key** — saved securely to `~/.flow-code-config` (mode `0o600`)
-3. **Choose a model** — fetched live from the provider
-4. **Select intensity** — Low, Medium, or High
+1. **Select a provider** -- Groq or Cerebras
+2. **Enter your API key** -- saved securely to `~/.flow-code-config` (mode `0o600`)
+3. **Choose a model** -- fetched live from the provider
+4. **Select intensity** -- Low, Medium, or High
 
 ## Slash Commands
 
@@ -60,13 +60,19 @@ On first run you'll be prompted to:
 
 ## Auto-File Writing
 
-Flow Code automatically writes files when the model generates code with filenames:
+Flow Code automatically writes files when the model generates code with filenames. The model is instructed to use this format:
 
-- Code block with filename as first line: `filename.ext` then ```` ```lang ``
-- "Create/write/save file" instructions followed by code
-- Common filenames like `index.html`, `style.css`, `app.js`
+```
+```path/to/file.ts
+<code here>
+```
+```
 
-Files are saved to your current working directory with parent directories created automatically.
+This ensures files are auto-saved to your current working directory with parent directories created automatically.
+
+Other patterns also detected:
+- "Create/write/save file" instructions followed by a code block
+- Common filenames like `index.html`, `style.css`, `app.js` followed by code
 
 ## Auto-Search
 
@@ -92,12 +98,12 @@ Code-only tasks (create, write, build, fix) are never auto-searched.
 
 Flow Code enforces production-quality code output:
 
-- **TypeScript** — strict mode, no `any`, interfaces, async/await, optional chaining
-- **React / Next.js** — functional components, hooks, App Router, Tailwind CSS
-- **HTML / CSS** — semantic elements, custom properties, flexbox/grid, mobile-first
-- **Python** — type hints, PEP 8, f-strings, pathlib, dataclasses
-- **Bash** — `set -euo pipefail`, quoted variables, non-interactive flags
-- **Database** — parameterized queries, indexes, transactions
+- **TypeScript** -- strict mode, no `any`, interfaces, async/await, optional chaining
+- **React / Next.js** -- functional components, hooks, App Router, Tailwind CSS
+- **HTML / CSS** -- semantic elements, custom properties, flexbox/grid, mobile-first
+- **Python** -- type hints, PEP 8, f-strings, pathlib, dataclasses
+- **Bash** -- `set -euo pipefail`, quoted variables, non-interactive flags
+- **Database** -- parameterized queries, indexes, transactions
 
 ## Settings Menu
 
@@ -130,7 +136,7 @@ Activity history is stored at `~/.flow-code-activity`.
 Flow Code uses a **128,000 token** context window:
 
 - System prompt + directory tree
-- Conversation history (auto-trimmed to 110k tokens)
+- Conversation history (auto-trimmed to 8k tokens)
 - Search results injected into context
 - Terminal output from auto-executed bash blocks
 
@@ -138,7 +144,7 @@ Usage is displayed after every response:
 
 ```
 Tokens: 3420 prompt + 1847 completion = 5267 total
-Context: ██████████████░░░░░░ 8,241 / 128,000 tokens (6%)
+Context: [████████████████░░░░] 8,241 / 128,000 tokens (6%)
 ```
 
 ## Security
@@ -147,7 +153,7 @@ Context: ██████████████░░░░░░ 8,241 / 12
 - API key masked in `/settings` view output
 - Model IDs sanitized (no injection possible)
 - Null byte prevention in `cd` paths
-- Bash output capped at 8,000 chars to prevent context overflow
+- Bash output capped at 2,000 chars to prevent context overflow
 - Shell commands timeout after 60 seconds
 - Graceful `SIGINT`/`SIGTERM` handling
 

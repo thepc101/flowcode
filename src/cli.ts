@@ -13,9 +13,11 @@ import { spawn } from "child_process";
 
 const CONFIG_PATH = path.join(os.homedir(), ".flow-code-config");
 const SESSION_PATH = path.join(os.homedir(), ".flow-code-session");
+const ACTIVITY_PATH = path.join(os.homedir(), ".flow-code-activity");
 const CONTEXT_WINDOW = 128000;
 const MAX_HISTORY_TOKENS = 8000;
 const MAX_RESPONSE_TOKENS = 4096;
+const VERSION = "1.1.0";
 
 const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
@@ -26,8 +28,13 @@ const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
 const MAGENTA = "\x1b[35m";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 type Intensity = "low" | "medium" | "high";
 type Provider = "groq" | "cerebras";
+type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 interface Config {
   apiKey: string;
@@ -48,11 +55,42 @@ interface SearchResult {
   url: string;
 }
 
+interface FileToWrite {
+  path: string;
+  content: string;
+}
+
+interface ActivityEntry {
+  time: number;
+  action: string;
+}
+
+interface SessionData {
+  history: Array<{ role: string; content: string }>;
+  model: string;
+  provider: Provider;
+  intensity: Intensity;
+  cwd: string;
+  timestamp: number;
+}
+
+interface SessionState {
+  client: OpenAI;
+  model: string;
+  intensity: Intensity;
+  provider: Provider;
+}
+
 // ---------------------------------------------------------------------------
 // Provider configuration
 // ---------------------------------------------------------------------------
 
-const PROVIDERS: Record<Provider, { name: string; baseURL: string; defaultModel: string; models: RegExp }> = {
+const PROVIDERS: Record<Provider, {
+  name: string;
+  baseURL: string;
+  defaultModel: string;
+  models: RegExp;
+}> = {
   groq: {
     name: "Groq",
     baseURL: "https://api.groq.com/openai/v1",
@@ -98,19 +136,14 @@ function renderUsageBar(used: number, total: number): string {
   const pct = Math.min(used / total, 1);
   const filled = Math.round(pct * 20);
   const empty = 20 - filled;
-  const bar = GREEN + "█".repeat(filled) + RESET + DIM + "░".repeat(empty) + RESET;
+  const bar = GREEN + "\u2588".repeat(filled) + RESET + DIM + "\u2591".repeat(empty) + RESET;
   const pctStr = Math.round(pct * 100) + "%";
   return `  ${c.dim("Context:")} ${bar} ${c.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
 }
 
 function printUsage(usage: UsageInfo, history: Message[]): void {
   const totalUsed = history.reduce((acc, msg) => {
-    const content =
-      typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map((p) => ("text" in p ? p.text : "")).join("")
-          : "";
+    const content = getMessageContent(msg);
     return acc + estimateTokens(content);
   }, 0);
 
@@ -123,7 +156,19 @@ function printUsage(usage: UsageInfo, history: Message[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// Web search — DuckDuckGo, no API key needed
+// Message content extraction
+// ---------------------------------------------------------------------------
+
+function getMessageContent(msg: Message): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((p) => ("text" in p ? p.text : "")).join("");
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Web search - DuckDuckGo, no API key needed
 // ---------------------------------------------------------------------------
 
 async function searchWeb(query: string, numResults: number = 5): Promise<SearchResult[]> {
@@ -131,7 +176,8 @@ async function searchWeb(query: string, numResults: number = 5): Promise<SearchR
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const res = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       },
       signal: AbortSignal.timeout(10000),
     });
@@ -139,8 +185,8 @@ async function searchWeb(query: string, numResults: number = 5): Promise<SearchR
     const html = await res.text();
     const results: SearchResult[] = [];
 
-    // Extract result blocks
-    const resultRegex = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    const resultRegex =
+      /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
     let match: RegExpExecArray | null;
 
     while ((match = resultRegex.exec(html)) !== null && results.length < numResults) {
@@ -148,7 +194,6 @@ async function searchWeb(query: string, numResults: number = 5): Promise<SearchR
       const title = match[2].replace(/<[^>]*>/g, "").trim();
       const snippet = match[3].replace(/<[^>]*>/g, "").trim();
 
-      // DuckDuckGo wraps URLs in a redirect — extract the actual URL
       const urlMatch = rawUrl.match(/uddg=([^&]+)/);
       const finalUrl = urlMatch ? decodeURIComponent(urlMatch[1]) : rawUrl;
 
@@ -176,12 +221,12 @@ function formatSearchResults(results: SearchResult[], query: string): string {
     "",
   ];
 
-  results.forEach((r, i) => {
+  for (const [i, r] of results.entries()) {
     lines.push(`  ${c.bold(c.green(`${i + 1}.`))} ${c.bold(r.title)}`);
     lines.push(`     ${c.dim(r.snippet)}`);
     lines.push(`     ${c.dim(r.url)}`);
     lines.push("");
-  });
+  }
 
   return lines.join("\n");
 }
@@ -202,7 +247,6 @@ async function fetchUrlContent(url: string): Promise<string> {
 
     const html = await res.text();
 
-    // Strip HTML tags and collapse whitespace
     const text = html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -215,7 +259,6 @@ async function fetchUrlContent(url: string): Promise<string> {
       .replace(/\s+/g, " ")
       .trim();
 
-    // Return first 12000 chars
     return text.slice(0, 12000);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Fetch failed";
@@ -224,15 +267,8 @@ async function fetchUrlContent(url: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Recent activity log
+// Activity log
 // ---------------------------------------------------------------------------
-
-const ACTIVITY_PATH = path.join(os.homedir(), ".flow-code-activity");
-
-interface ActivityEntry {
-  time: number;
-  action: string;
-}
 
 function logActivity(action: string): void {
   try {
@@ -241,9 +277,14 @@ function logActivity(action: string): void {
       entries = JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8"));
     }
     entries.unshift({ time: Date.now(), action });
-    entries = entries.slice(0, 20); // keep last 20
-    fs.writeFileSync(ACTIVITY_PATH, JSON.stringify(entries, null, 2), { encoding: "utf-8", mode: 0o600 });
-  } catch { /* ignore */ }
+    entries = entries.slice(0, 20);
+    fs.writeFileSync(ACTIVITY_PATH, JSON.stringify(entries, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } catch {
+    /* ignore */
+  }
 }
 
 function getRecentActivity(): ActivityEntry[] {
@@ -251,7 +292,9 @@ function getRecentActivity(): ActivityEntry[] {
     if (fs.existsSync(ACTIVITY_PATH)) {
       return JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8")).slice(0, 5);
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return [];
 }
 
@@ -268,17 +311,8 @@ function timeAgo(ts: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Session save / load (for /resume)
+// Session save / load
 // ---------------------------------------------------------------------------
-
-interface SessionData {
-  history: Array<{ role: string; content: string }>;
-  model: string;
-  provider: Provider;
-  intensity: Intensity;
-  cwd: string;
-  timestamp: number;
-}
 
 function saveSession(
   history: Message[],
@@ -290,7 +324,7 @@ function saveSession(
     const data: SessionData = {
       history: history.map((m) => ({
         role: m.role,
-        content: typeof m.content === "string" ? m.content : "",
+        content: getMessageContent(m),
       })),
       model,
       provider,
@@ -302,7 +336,9 @@ function saveSession(
       encoding: "utf-8",
       mode: 0o600,
     });
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 function loadSession(): SessionData | null {
@@ -310,7 +346,9 @@ function loadSession(): SessionData | null {
     if (fs.existsSync(SESSION_PATH)) {
       return JSON.parse(fs.readFileSync(SESSION_PATH, "utf-8")) as SessionData;
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return null;
 }
 
@@ -335,12 +373,8 @@ function formatSessionAge(ts: number): string {
 function printBanner(): void {
   console.clear();
   console.log("");
-  console.log(c.blue("  ╔══════════════════════════════════════╗"));
-  console.log(c.blue("  ║                                      ║"));
-  console.log(c.blue("  ║   ") + c.bold(c.blue("F L O W   C O D E")) + c.blue("               ║"));
-  console.log(c.blue("  ║                                      ║"));
-  console.log(c.blue("  ╚══════════════════════════════════════╝"));
-  console.log(c.dim("          [FREE & OPEN SOURCE]"));
+  console.log(`  ${c.bold(c.blue("Flow Code"))} ${c.dim(`v${VERSION}`)}`);
+  console.log(c.dim("  Free & Open Source Terminal Coding Agent"));
   console.log("");
 }
 
@@ -355,7 +389,7 @@ function printDashboard(config: Config): void {
   const hline = c.dim("-".repeat(w));
 
   console.log("");
-  console.log(`  ${c.dim("---")} ${c.bold(c.blue("Flow Code"))} ${c.dim("v1.0.0")} ${c.dim("-".repeat(w - 26))}`);
+  console.log(`  ${c.dim("---")} ${c.bold(c.blue("Flow Code"))} ${c.dim(`v${VERSION}`)} ${c.dim("-".repeat(w - 26))}`);
   console.log("");
 
   console.log(`  ${c.bold("Welcome back!")}`);
@@ -370,7 +404,8 @@ function printDashboard(config: Config): void {
     console.log(`  ${c.bold(c.yellow("Recent activity"))}`);
     for (const entry of activity) {
       const ago = timeAgo(entry.time);
-      const action = entry.action.length > 40 ? entry.action.slice(0, 37) + "..." : entry.action;
+      const action =
+        entry.action.length > 40 ? entry.action.slice(0, 37) + "..." : entry.action;
       console.log(`  ${c.dim(ago.padEnd(10))} ${action}`);
     }
   }
@@ -402,9 +437,7 @@ function ask(question: string): Promise<string> {
 }
 
 async function askMultiline(): Promise<string> {
-  const first = await ask(
-    c.blue(`flow-code [${path.basename(process.cwd())}] > `)
-  );
+  const first = await ask(c.blue(`flow-code [${path.basename(process.cwd())}] > `));
   if (!first) return "";
 
   if (first.endsWith("\\")) {
@@ -447,7 +480,7 @@ function execShellStreaming(
       child.stdout?.on("data", (data: Buffer) => {
         const chunk = data.toString();
         stdout += chunk;
-        process.stdout.write(c.dim("  │ ") + chunk);
+        process.stdout.write(c.dim("  | ") + chunk);
       });
 
       child.stderr?.on("data", (data: Buffer) => {
@@ -480,15 +513,36 @@ function execShellStreaming(
 // ---------------------------------------------------------------------------
 
 const IGNORE_DIRS = new Set([
-  "node_modules", ".git", "dist", "build", ".next", ".cache",
-  "__pycache__", ".vscode", ".idea", "coverage", ".turbo",
-  ".vercel", ".netlify", "target", "vendor", ".tox", "venv", ".venv",
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  ".cache",
+  "__pycache__",
+  ".vscode",
+  ".idea",
+  "coverage",
+  ".turbo",
+  ".vercel",
+  ".netlify",
+  "target",
+  "vendor",
+  ".tox",
+  "venv",
+  ".venv",
 ]);
 
 const IGNORE_FILES = new Set([
-  ".DS_Store", "Thumbs.db", ".env", ".env.local",
-  ".env.development", ".env.production",
-  "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+  ".DS_Store",
+  "Thumbs.db",
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.production",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
 ]);
 
 function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): string {
@@ -498,26 +552,40 @@ function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): str
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const dirs = entries
-      .filter((e) => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith("."))
+      .filter(
+        (e) =>
+          e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith(".")
+      )
       .sort((a, b) => a.name.localeCompare(b.name));
     const files = entries
-      .filter((e) => e.isFile() && !IGNORE_FILES.has(e.name) && !e.name.startsWith("."))
+      .filter(
+        (e) =>
+          e.isFile() && !IGNORE_FILES.has(e.name) && !e.name.startsWith(".")
+      )
       .sort((a, b) => a.name.localeCompare(b.name));
 
-    [...dirs, ...files].forEach((entry, i) => {
-      const isLast = i === [...dirs, ...files].length - 1;
-      const connector = isLast ? "└── " : "├── ";
-      const childPrefix = isLast ? "    " : "│   ";
+    const all = [...dirs, ...files];
+    for (let i = 0; i < all.length; i++) {
+      const entry = all[i];
+      const isLast = i === all.length - 1;
+      const connector = isLast ? "\\--- " : "|-- ";
+      const childPrefix = isLast ? "    " : "|   ";
 
       if (entry.isDirectory()) {
         lines.push(`${prefix}${connector}${entry.name}/`);
-        const sub = scanDirectory(path.join(dir, entry.name), depth - 1, prefix + childPrefix);
+        const sub = scanDirectory(
+          path.join(dir, entry.name),
+          depth - 1,
+          prefix + childPrefix
+        );
         if (sub) lines.push(sub);
       } else {
         lines.push(`${prefix}${connector}${entry.name}`);
       }
-    });
-  } catch { /* permission denied */ }
+    }
+  } catch {
+    /* permission denied */
+  }
 
   return lines.join("\n");
 }
@@ -527,15 +595,48 @@ function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): str
 // ---------------------------------------------------------------------------
 
 const LANG_LABELS: Record<string, string> = {
-  html: "HTML", css: "CSS", js: "JavaScript", javascript: "JavaScript",
-  ts: "TypeScript", typescript: "TypeScript", py: "Python", python: "Python",
-  json: "JSON", yaml: "YAML", yml: "YAML", md: "Markdown",
-  bash: "Bash", sh: "Shell", shell: "Shell", jsx: "JSX", tsx: "TSX",
-  sql: "SQL", rust: "Rust", go: "Go", java: "Java", c: "C", cpp: "C++",
-  rb: "Ruby", php: "PHP", swift: "Swift", kt: "Kotlin", toml: "TOML",
-  xml: "XML", svg: "SVG", dockerfile: "Dockerfile", makefile: "Makefile",
-  prisma: "Prisma", graphql: "GraphQL", lua: "Lua", r: "R", dart: "Dart",
-  scala: "Scala", ex: "Elixir", exs: "Elixir", hs: "Haskell", clj: "Clojure",
+  html: "HTML",
+  css: "CSS",
+  js: "JavaScript",
+  javascript: "JavaScript",
+  ts: "TypeScript",
+  typescript: "TypeScript",
+  py: "Python",
+  python: "Python",
+  json: "JSON",
+  yaml: "YAML",
+  yml: "YAML",
+  md: "Markdown",
+  bash: "Bash",
+  sh: "Shell",
+  shell: "Shell",
+  jsx: "JSX",
+  tsx: "TSX",
+  sql: "SQL",
+  rust: "Rust",
+  go: "Go",
+  java: "Java",
+  c: "C",
+  cpp: "C++",
+  rb: "Ruby",
+  php: "PHP",
+  swift: "Swift",
+  kt: "Kotlin",
+  toml: "TOML",
+  xml: "XML",
+  svg: "SVG",
+  dockerfile: "Dockerfile",
+  makefile: "Makefile",
+  prisma: "Prisma",
+  graphql: "GraphQL",
+  lua: "Lua",
+  r: "R",
+  dart: "Dart",
+  scala: "Scala",
+  ex: "Elixir",
+  exs: "Elixir",
+  hs: "Haskell",
+  clj: "Clojure",
 };
 
 function renderCodeBox(lang: string, code: string): string {
@@ -543,11 +644,12 @@ function renderCodeBox(lang: string, code: string): string {
   const lines = code.split("\n");
   const maxLen = Math.max(label.length + 4, ...lines.map((l) => l.length));
   const width = Math.min(maxLen + 2, 120);
-  const top = `${DIM}┌─ ${label} ${"─".repeat(Math.max(0, width - label.length - 3))}┐${RESET}`;
-  const bottom = `${DIM}└${"─".repeat(width)}┘${RESET}`;
+  const top = `${DIM}+-- ${label} ${"-".repeat(Math.max(0, width - label.length - 3))}+${RESET}`;
+  const bottom = `${DIM}+${"-".repeat(width)}+${RESET}`;
   const body = lines.map((line) => {
-    const truncated = line.length > width ? line.slice(0, width - 3) + "..." : line;
-    return `${DIM}│${RESET} ${truncated}`;
+    const truncated =
+      line.length > width ? line.slice(0, width - 3) + "..." : line;
+    return `${DIM}|${RESET} ${truncated}`;
   });
   return [top, ...body, bottom].join("\n");
 }
@@ -563,20 +665,45 @@ function formatResponse(text: string): string {
 // System prompt
 // ---------------------------------------------------------------------------
 
-function getSystemPrompt(intensity: Intensity, cwd: string, provider: Provider): string {
+function getSystemPrompt(
+  intensity: Intensity,
+  cwd: string,
+  provider: Provider
+): string {
   const providerName = PROVIDERS[provider].name;
   const dirTree = scanDirectory(cwd, 1);
 
-  return [
-    `FLOW CODE (${providerName}). Write production code.`,
+  const lines = [
+    `FLOW CODE (${providerName}). Write production-quality code.`,
     `CWD: ${cwd}`,
-    dirTree ? `Files: ${dirTree}` : "",
-    "Rules: read before modify. TS: no any, interfaces. React: functional, hooks. HTML: semantic, responsive. Bash: set -euo pipefail. Complete files only. Fenced code blocks.",
-  ].filter(Boolean).join("\n");
+  ];
+
+  if (dirTree) {
+    lines.push(`Files:\n${dirTree}`);
+  }
+
+  lines.push(
+    "Rules:",
+    "- Always write complete, production-ready files.",
+    "- When creating/updating files, put the filename on the first line inside the code block, e.g.:",
+    "  ```path/to/file.ts",
+    "  <code here>",
+    "  ```",
+    "- This ensures files are auto-saved to disk.",
+    "- Read existing files before modifying them.",
+    "- TypeScript: no any, use interfaces, async/await, optional chaining.",
+    "- React/Next.js: functional components, hooks, App Router, Tailwind CSS.",
+    "- HTML/CSS: semantic elements, responsive, flexbox/grid.",
+    "- Python: type hints, PEP 8, f-strings.",
+    "- Bash: set -euo pipefail, quoted variables.",
+    "- For small changes, just show the diff. For new files, write the full file.",
+  );
+
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Config + setup
+// Config
 // ---------------------------------------------------------------------------
 
 function loadConfig(): Config {
@@ -584,11 +711,22 @@ function loadConfig(): Config {
     if (fs.existsSync(CONFIG_PATH)) {
       const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
       const parsed = JSON.parse(raw);
-      if (typeof parsed.apiKey === "string" && parsed.apiKey.length > 0) {
-        return parsed as Config;
+      if (typeof parsed === "object" && parsed !== null) {
+        return {
+          apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
+          provider: ["groq", "cerebras"].includes(parsed.provider)
+            ? parsed.provider
+            : "groq",
+          defaultModel: typeof parsed.defaultModel === "string" ? parsed.defaultModel : undefined,
+          intensity: ["low", "medium", "high"].includes(parsed.intensity)
+            ? parsed.intensity
+            : undefined,
+        };
       }
     }
-  } catch { /* start fresh */ }
+  } catch {
+    /* start fresh */
+  }
   return { apiKey: "", provider: "groq" };
 }
 
@@ -603,6 +741,10 @@ function sanitizeModelId(id: string): string {
   return id.replace(/[^a-zA-Z0-9._/-]/g, "").slice(0, 128);
 }
 
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
 async function setup(): Promise<{
   client: OpenAI;
   model: string;
@@ -615,8 +757,12 @@ async function setup(): Promise<{
   let provider: Provider = config.provider || "groq";
   if (!config.apiKey) {
     console.log(c.bold("  Select AI Provider:"));
-    console.log(`    ${c.dim("[1]")} Groq    — Ultra-fast inference, open-source models`);
-    console.log(`    ${c.dim("[2]")} Cerebras — Wafer-scale AI, blazing speed`);
+    console.log(
+      `    ${c.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`
+    );
+    console.log(
+      `    ${c.dim("[2]")} Cerebras -- Wafer-scale AI, blazing speed`
+    );
     const pChoice = await ask("  Select (1-2): ");
     provider = pChoice === "2" ? "cerebras" : "groq";
   }
@@ -644,7 +790,9 @@ async function setup(): Promise<{
   });
 
   // Model selection
-  let model = sanitizeModelId(config.defaultModel || PROVIDERS[provider].defaultModel);
+  let model = sanitizeModelId(
+    config.defaultModel || PROVIDERS[provider].defaultModel
+  );
 
   try {
     console.log(c.dim(`  Fetching ${PROVIDERS[provider].name} models...`));
@@ -656,8 +804,12 @@ async function setup(): Promise<{
 
     if (models.length > 0) {
       console.log(c.bold("\n  Available Models:"));
-      models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
-      const choice = await ask(`\n  Select model (0-${models.length - 1}, Enter for default): `);
+      models.forEach((m, i) =>
+        console.log(`    ${c.dim(`[${i}]`)} ${m}`)
+      );
+      const choice = await ask(
+        `\n  Select model (0-${models.length - 1}, Enter for default): `
+      );
       if (choice !== "") {
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
@@ -671,11 +823,15 @@ async function setup(): Promise<{
 
   // Intensity
   console.log(c.bold("\n  Processing Mode:"));
-  console.log(`    ${c.dim("[1]")} Low    — Fast, single-file patches`);
-  console.log(`    ${c.dim("[2]")} Medium — Standard refactoring`);
-  console.log(`    ${c.dim("[3]")} High   — Deep scanning & DevOps`);
+  console.log(`    ${c.dim("[1]")} Low    -- Fast, single-file patches`);
+  console.log(`    ${c.dim("[2]")} Medium -- Standard refactoring`);
+  console.log(`    ${c.dim("[3]")} High   -- Deep scanning & DevOps`);
 
-  const intensityMap: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
+  const intensityMap: Record<string, Intensity> = {
+    "1": "low",
+    "2": "medium",
+    "3": "high",
+  };
   let intensity: Intensity = config.intensity || "medium";
   const choice = await ask("  Select mode (1-3): ");
   if (intensityMap[choice]) intensity = intensityMap[choice];
@@ -686,9 +842,17 @@ async function setup(): Promise<{
   saveConfig(config);
 
   console.log("");
-  console.log(c.green(`  ✔ ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`));
+  console.log(
+    c.green(
+      `  [OK] ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`
+    )
+  );
   console.log(c.dim(`  Context: ${CONTEXT_WINDOW.toLocaleString()} tokens`));
-  console.log(c.dim("  Commands: exit, cd, /clear, /compact, /help, /models, /search, /fetch\n"));
+  console.log(
+    c.dim(
+      "  Commands: exit, cd, /clear, /compact, /help, /models, /search, /fetch\n"
+    )
+  );
 
   return { client, model, intensity, provider };
 }
@@ -697,25 +861,18 @@ async function setup(): Promise<{
 // History management
 // ---------------------------------------------------------------------------
 
-type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
-
 function trimHistory(history: Message[]): Message[] {
   let total = 0;
   const result: Message[] = [];
 
   if (history.length > 0 && history[0].role === "system") {
     result.push(history[0]);
-    total += estimateTokens(history[0].content as string);
+    total += estimateTokens(getMessageContent(history[0]));
   }
 
   for (let i = history.length - 1; i >= 1; i--) {
     const msg = history[i];
-    const content =
-      typeof msg.content === "string"
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map((p) => ("text" in p ? p.text : "")).join("")
-          : "";
+    const content = getMessageContent(msg);
     const tokens = estimateTokens(content);
     if (total + tokens > MAX_HISTORY_TOKENS) break;
     total += tokens;
@@ -731,7 +888,7 @@ function trimHistory(history: Message[]): Message[] {
 
 function extractBashBlocks(text: string): string[] {
   const blocks: string[] = [];
-  const regex = /```bash\n([\s\S]*?)```/g;
+  const regex = /```(?:bash|sh|shell)\n([\s\S]*?)```/g;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const block = match[1].trim();
@@ -741,53 +898,154 @@ function extractBashBlocks(text: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// File writing — auto-detect and manual /write command
+// File writing - auto-detect and manual /write command
 // ---------------------------------------------------------------------------
 
-interface FileToWrite {
-  path: string;
-  content: string;
-}
+const COMMON_FILENAMES = new Set([
+  // Web
+  "index.html",
+  "style.css",
+  "app.js",
+  "main.js",
+  "App.tsx",
+  "App.jsx",
+  "index.tsx",
+  "index.jsx",
+  "page.tsx",
+  "page.jsx",
+  "layout.tsx",
+  "layout.jsx",
+  "globals.css",
+  "tailwind.config.js",
+  "tailwind.config.ts",
+  "next.config.js",
+  "next.config.ts",
+  "vite.config.js",
+  "vite.config.ts",
+  "webpack.config.js",
+  "tsconfig.json",
+  "package.json",
+  ".env.example",
+  "README.md",
+  // Python
+  "app.py",
+  "main.py",
+  "server.py",
+  "requirements.txt",
+  "setup.py",
+  "pyproject.toml",
+  // Rust
+  "Cargo.toml",
+  "main.rs",
+  "lib.rs",
+  // Go
+  "go.mod",
+  "main.go",
+  // Config
+  "Dockerfile",
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  ".gitignore",
+  "Makefile",
+  "Procfile",
+]);
 
 function extractFilesFromResponse(text: string, cwd: string): FileToWrite[] {
   const files: FileToWrite[] = [];
+  const seen = new Set<string>();
 
-  // Pattern 1: ```filename.ext\n...\n``` (code block with filename as first line)
-  const namedBlockRegex = /```(\S+\.\S+)\n([\s\S]*?)```/g;
+  // Strategy 1: Code block where the first non-empty line is a filename
+  // ```src/app.tsx\nimport ...\n```
+  // This is the primary pattern the model should use
+  const filenameBlockRegex = /```([^\s`]+\.[^\s`]+)\n([\s\S]*?)```/g;
   let match: RegExpExecArray | null;
-  while ((match = namedBlockRegex.exec(text)) !== null) {
-    const filename = match[1];
+  while ((match = filenameBlockRegex.exec(text)) !== null) {
+    const filename = match[1].trim();
     const content = match[2].trim();
-    // Skip if it looks like a language tag, not a filename
-    if (!/^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php)$/i.test(filename)) {
-      files.push({ path: path.resolve(cwd, filename), content });
+
+    // Skip if it's a known language tag (not a filename)
+    const knownLangs =
+      /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php|jsx|tsx|swift|kt|toml|xml|svg|dockerfile|makefile|prisma|graphql|lua|r|dart|scala|ex|hs|clj|text|txt)$/i;
+    if (knownLangs.test(filename)) continue;
+    // Skip if it doesn't look like a real filename (must have a dot)
+    if (!filename.includes(".")) continue;
+
+    const absPath = path.resolve(cwd, filename);
+    if (!seen.has(absPath) && content.length > 0) {
+      seen.add(absPath);
+      files.push({ path: absPath, content });
     }
   }
 
-  // Pattern 2: "create/write/save file <path>" followed by code block
-  const writeFileRegex = /(?:create|write|save|make)\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?[`"']?([^\s`"']+\.\S+)[`"']?\s*(?:with|containing|using)?[\s\S]*?```(\w*)\n([\s\S]*?)```/gi;
-  while ((match = writeFileRegex.exec(text)) !== null) {
-    const filename = match[1];
-    const content = match[3].trim();
-    files.push({ path: path.resolve(cwd, filename), content });
+  // Strategy 2: "create/write/save file <path>" followed by a code block
+  const createFileRegex =
+    /(?:create|write|save|make|generate)\s+(?:a\s+)?(?:new\s+)?(?:file\s+(?:called\s+|named\s+|at\s+)?)?["'`]?([^\s"'`]+\.[^\s"'`]+)["'`]?[\s\S]*?```(?:\w*)\n([\s\S]*?)```/gi;
+  while ((match = createFileRegex.exec(text)) !== null) {
+    const filename = match[1].trim();
+    const content = match[2].trim();
+
+    if (content.length === 0) continue;
+    if (!filename.includes(".")) continue;
+
+    const absPath = path.resolve(cwd, filename);
+    if (!seen.has(absPath)) {
+      seen.add(absPath);
+      files.push({ path: absPath, content });
+    }
   }
 
-  // Pattern 3: index.html, style.css, app.js, main.ts, etc. at start of line
-  const standaloneFileRegex = /^(index\.html|style\.css|app\.js|main\.ts|App\.tsx|App\.jsx|page\.tsx|layout\.tsx|globals\.css|package\.ts|tsconfig\.json|\.env\.example|README\.md|server\.py|main\.py|app\.py)\s*(?:\n|$)/gm;
-  while ((match = standaloneFileRegex.exec(text)) !== null) {
-    const filename = match[1];
-    // Find the next code block after this filename
-    const afterFilename = text.slice(match.index + filename.length);
-    const codeMatch = afterFilename.match(/```(\w*)\n([\s\S]*?)```/);
-    if (codeMatch) {
-      files.push({ path: path.resolve(cwd, filename), content: codeMatch[2].trim() });
+  // Strategy 3: Standalone common filenames on their own line followed by a code block
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    // Match lines like "index.html", "**index.html**", "## index.html", "### style.css"
+    const filenameMatch = line.match(
+      /^(?:#+\s+|\*\*)?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{1,10})(?:\*\*)?\s*$/
+    );
+    if (!filenameMatch) continue;
+
+    const filename = filenameMatch[1];
+    if (!COMMON_FILENAMES.has(filename)) continue;
+
+    // Look for the next code block after this line
+    const remaining = lines.slice(i + 1).join("\n");
+    const codeMatch = remaining.match(/```(\w*)\n([\s\S]*?)```/);
+    if (codeMatch && codeMatch[2].trim().length > 0) {
+      const absPath = path.resolve(cwd, filename);
+      if (!seen.has(absPath)) {
+        seen.add(absPath);
+        files.push({ path: absPath, content: codeMatch[2].trim() });
+      }
+    }
+  }
+
+  // Strategy 4: File path followed by code block (src/components/Button.tsx etc.)
+  const pathFileRegex =
+    /(?:^|\n)([a-zA-Z0-9_\-\/]+\.[a-zA-Z0-9]{1,10})\s*\n```(?:\w*)\n([\s\S]*?)```/g;
+  while ((match = pathFileRegex.exec(text)) !== null) {
+    const filename = match[1].trim();
+    const content = match[2].trim();
+
+    if (content.length === 0) continue;
+    if (!filename.includes("/") && !filename.includes(".")) continue;
+
+    // Skip language tags
+    const knownLangs =
+      /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php)$/i;
+    if (knownLangs.test(filename)) continue;
+
+    const absPath = path.resolve(cwd, filename);
+    if (!seen.has(absPath)) {
+      seen.add(absPath);
+      files.push({ path: absPath, content });
     }
   }
 
   return files;
 }
 
-function writeFiles(files: FileToWrite[]): void {
+function writeFiles(files: FileToWrite[]): boolean {
+  let anyWritten = false;
   for (const file of files) {
     try {
       const dir = path.dirname(file.path);
@@ -795,13 +1053,18 @@ function writeFiles(files: FileToWrite[]): void {
         fs.mkdirSync(dir, { recursive: true });
       }
       fs.writeFileSync(file.path, file.content, "utf-8");
-      console.log(c.green(`  📄 Created: ${path.relative(process.cwd(), file.path)}`));
-      logActivity(`Created: ${path.basename(file.path)}`);
+      const rel = path.relative(process.cwd(), file.path);
+      console.log(c.green(`  [CREATED] ${rel}`));
+      logActivity(`Created: ${rel}`);
+      anyWritten = true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Write failed";
-      console.error(c.red(`  ✘ Failed to write ${path.basename(file.path)}: ${msg}`));
+      console.error(
+        c.red(`  [FAILED] ${path.basename(file.path)}: ${msg}`)
+      );
     }
   }
+  return anyWritten;
 }
 
 // ---------------------------------------------------------------------------
@@ -832,11 +1095,13 @@ const SEARCH_TRIGGERS = [
 ];
 
 function needsWebSearch(input: string): boolean {
-  // Skip if it's clearly a code-only task
-  if (/^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update)\s/i.test(input)) {
+  if (
+    /^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update)\s/i.test(
+      input
+    )
+  ) {
     return false;
   }
-  // Skip short inputs
   if (input.length < 15) return false;
   return SEARCH_TRIGGERS.some((re) => re.test(input));
 }
@@ -867,7 +1132,11 @@ async function streamResponse(
       });
 
       let fullResponse = "";
-      let usage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      let usage: UsageInfo = {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+      };
       let started = false;
 
       for await (const chunk of stream) {
@@ -898,15 +1167,21 @@ async function streamResponse(
       if (msg.includes("429") && attempt < retries) {
         process.stdout.write(" ".repeat(30) + "\r");
         const wait = (attempt + 1) * 5;
-        console.log(c.yellow(`  ⚠ Rate limited. Retrying in ${wait}s...`));
+        console.log(
+          c.yellow(`  Rate limited. Retrying in ${wait}s...`)
+        );
         await new Promise((r) => setTimeout(r, wait * 1000));
-        process.stdout.write(c.dim("  ⏳ Thinking...\r"));
+        process.stdout.write(c.dim("  Thinking...\r"));
         continue;
       }
 
       if (msg.includes("413") || msg.includes("too large")) {
         process.stdout.write(" ".repeat(30) + "\r");
-        console.log(c.yellow("  ⚠ Request too large. Try a shorter message or /compact to clear history."));
+        console.log(
+          c.yellow(
+            "  Request too large. Try a shorter message or /compact to clear history."
+          )
+        );
         throw err;
       }
 
@@ -921,13 +1196,6 @@ async function streamResponse(
 // Main agent loop
 // ---------------------------------------------------------------------------
 
-interface SessionState {
-  client: OpenAI;
-  model: string;
-  intensity: Intensity;
-  provider: Provider;
-}
-
 async function run(
   client: OpenAI,
   model: string,
@@ -936,160 +1204,196 @@ async function run(
 ): Promise<void> {
   const state: SessionState = { client, model, intensity, provider };
   const history: Message[] = [
-    { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) },
+    {
+      role: "system",
+      content: getSystemPrompt(state.intensity, process.cwd(), state.provider),
+    },
   ];
 
   while (true) {
     const input = await askMultiline();
     if (!input) continue;
 
-    // ── Exit ──
+    // -- Exit --
     if (input === "exit" || input === "quit") {
       console.log(c.dim("\n  Goodbye.\n"));
       rl.close();
       process.exit(0);
     }
 
-    // ── /help ──
+    // -- /help --
     if (input === "/help") {
-      console.log([
-        "",
-        c.bold("  Commands:"),
-        `    ${c.dim("cd <path>")}        Switch directory`,
-        `    ${c.dim("/search <query>")}  Search the web`,
-        `    ${c.dim("/fetch <url>")}     Fetch URL content`,
-        `    ${c.dim("/write <file>")}    Write a file manually`,
-        `    ${c.dim("/settings")}        Configure preferences`,
-        `    ${c.dim("/models")}          Re-select model`,
-        `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
-        `    ${c.dim("/resume")}          Resume last conversation`,
-        `    ${c.dim("/clear")}           Reset conversation`,
-        `    ${c.dim("/compact")}         Trim context`,
-        `    ${c.dim("/cmds")}            List all commands`,
-        `    ${c.dim("/status")}          Show usage stats`,
-        `    ${c.dim("exit")}             Quit`,
-        "",
-        c.dim("  Auto-search: when a question needs current data,"),
-        c.dim("  the agent searches the web automatically."),
-        "",
-      ].join("\n"));
+      console.log(
+        [
+          "",
+          c.bold("  Commands:"),
+          `    ${c.dim("cd <path>")}        Switch directory`,
+          `    ${c.dim("/search <query>")}  Search the web`,
+          `    ${c.dim("/fetch <url>")}     Fetch URL content`,
+          `    ${c.dim("/write <file>")}    Write a file manually`,
+          `    ${c.dim("/settings")}        Configure preferences`,
+          `    ${c.dim("/models")}          Re-select model`,
+          `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
+          `    ${c.dim("/resume")}          Resume last conversation`,
+          `    ${c.dim("/clear")}           Reset conversation`,
+          `    ${c.dim("/compact")}         Trim context`,
+          `    ${c.dim("/cmds")}            List all commands`,
+          `    ${c.dim("/status")}          Show usage stats`,
+          `    ${c.dim("exit")}             Quit`,
+          "",
+          c.dim(
+            "  Auto-search: when a question needs current data,"
+          ),
+          c.dim("  the agent searches the web automatically."),
+          "",
+        ].join("\n")
+      );
       continue;
     }
 
-    // ── /clear ──
+    // -- /clear --
     if (input === "/clear") {
       history.length = 1;
-      history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
-      console.log(c.green("  ✔ Conversation cleared.\n"));
+      history[0] = {
+        role: "system",
+        content: getSystemPrompt(
+          state.intensity,
+          process.cwd(),
+          state.provider
+        ),
+      };
+      console.log(c.green("  [OK] Conversation cleared.\n"));
       continue;
     }
 
-    // ── /resume ──
+    // -- /resume --
     if (input === "/resume") {
       const session = loadSession();
       if (!session) {
-        console.log(c.yellow("  No saved session found. Start a conversation first.\n"));
+        console.log(
+          c.yellow("  No saved session found. Start a conversation first.\n")
+        );
         continue;
       }
-      // Restore history
       history.length = 0;
       for (const msg of session.history) {
-        history.push({ role: msg.role as "system" | "user" | "assistant", content: msg.content });
+        history.push({
+          role: msg.role as "system" | "user" | "assistant",
+          content: msg.content,
+        });
       }
-      // Restore cwd
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
-        history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
+        history[0] = {
+          role: "system",
+          content: getSystemPrompt(
+            state.intensity,
+            process.cwd(),
+            state.provider
+          ),
+        };
       }
-      const msgCount = history.filter((m) => m.role === "user" || m.role === "assistant").length;
-      console.log(c.green(`  ✔ Resumed ${msgCount} messages from ${formatSessionAge(session.timestamp)}.\n`));
-      console.log(c.dim(`  Model: ${session.model} | Provider: ${PROVIDERS[session.provider || "groq"].name}\n`));
+      const msgCount = history.filter(
+        (m) => m.role === "user" || m.role === "assistant"
+      ).length;
+      console.log(
+        c.green(
+          `  [OK] Resumed ${msgCount} messages from ${formatSessionAge(session.timestamp)}.\n`
+        )
+      );
+      console.log(
+        c.dim(
+          `  Model: ${session.model} | Provider: ${PROVIDERS[session.provider || "groq"].name}\n`
+        )
+      );
       continue;
     }
 
-    // ── /cmds ──
+    // -- /cmds --
     if (input === "/cmds") {
-      console.log([
-        "",
-        c.bold(c.blue("  Flow Code Commands")),
-        c.dim("  ─────────────────────────────────────────────"),
-        "",
-        c.bold("  Navigation:"),
-        `    ${c.cyan("cd <path>")}            Switch working directory`,
-        `    ${c.cyan("cd ..")}                Go up one directory`,
-        `    ${c.cyan("cd ~")}                 Go to home directory`,
-        "",
-        c.bold("  Web & Search:"),
-        `    ${c.cyan("/search <query>")}      Search the web via DuckDuckGo`,
-        `    ${c.cyan("/fetch <url>")}         Fetch and display URL content`,
-        "",
-        c.bold("  Files:"),
-        `    ${c.cyan("/write <file>")}        Write a file manually (paste content)`,
-        `    ${c.dim("Auto-write")}             Code blocks with filenames auto-save`,
-        "",
-        c.bold("  Session Management:"),
-        `    ${c.cyan("/resume")}              Resume last conversation`,
-        `    ${c.cyan("/clear")}               Reset conversation history`,
-        `    ${c.cyan("/compact")}             Trim history to fit context`,
-        "",
-        c.bold("  Configuration:"),
-        `    ${c.cyan("/settings")}            Open interactive settings menu`,
-        `    ${c.cyan("/models")}              Re-select your model`,
-        `    ${c.cyan("/provider")}            Switch between Groq / Cerebras`,
-        "",
-        c.bold("  Information:"),
-        `    ${c.cyan("/status")}              Show provider, model, tokens`,
-        `    ${c.cyan("/cmds")}                Show this command list`,
-        `    ${c.cyan("/help")}                Show condensed help`,
-        "",
-        c.bold("  Exit:"),
-        `    ${c.cyan("exit")}                 Quit Flow Code`,
-        `    ${c.cyan("quit")}                 Quit Flow Code`,
-        `    ${c.cyan("Ctrl+C")}               Quit Flow Code`,
-        "",
-        c.dim("  Multiline: end a line with \\ to continue."),
-        c.dim("  Auto-search: detects when queries need web data."),
-        "",
-      ].join("\n"));
+      console.log(
+        [
+          "",
+          c.bold(c.blue("  Flow Code Commands")),
+          c.dim("  --------------------------------------------"),
+          "",
+          c.bold("  Navigation:"),
+          `    ${c.cyan("cd <path>")}            Switch working directory`,
+          `    ${c.cyan("cd ..")}                Go up one directory`,
+          `    ${c.cyan("cd ~")}                 Go to home directory`,
+          "",
+          c.bold("  Web & Search:"),
+          `    ${c.cyan("/search <query>")}      Search the web via DuckDuckGo`,
+          `    ${c.cyan("/fetch <url>")}         Fetch and display URL content`,
+          "",
+          c.bold("  Files:"),
+          `    ${c.cyan("/write <file>")}        Write a file manually (paste content)`,
+          `    ${c.dim("Auto-write")}             Code blocks with filenames auto-save`,
+          "",
+          c.bold("  Session Management:"),
+          `    ${c.cyan("/resume")}              Resume last conversation`,
+          `    ${c.cyan("/clear")}               Reset conversation history`,
+          `    ${c.cyan("/compact")}             Trim history to fit context`,
+          "",
+          c.bold("  Configuration:"),
+          `    ${c.cyan("/settings")}            Open interactive settings menu`,
+          `    ${c.cyan("/models")}              Re-select your model`,
+          `    ${c.cyan("/provider")}            Switch between Groq / Cerebras`,
+          "",
+          c.bold("  Information:"),
+          `    ${c.cyan("/status")}              Show provider, model, tokens`,
+          `    ${c.cyan("/cmds")}                Show this command list`,
+          `    ${c.cyan("/help")}                Show condensed help`,
+          "",
+          c.bold("  Exit:"),
+          `    ${c.cyan("exit")}                 Quit Flow Code`,
+          `    ${c.cyan("quit")}                 Quit Flow Code`,
+          `    ${c.cyan("Ctrl+C")}               Quit Flow Code`,
+          "",
+          c.dim("  Multiline: end a line with \\ to continue."),
+          c.dim("  Auto-search: detects when queries need web data."),
+          "",
+        ].join("\n")
+      );
       continue;
     }
 
-    // ── /compact ──
+    // -- /compact --
     if (input === "/compact") {
       const before = history.length;
       const compacted = trimHistory(history);
       history.length = 0;
       history.push(...compacted);
-      console.log(c.green(`  ✔ Compacted: ${before} → ${history.length} messages.\n`));
+      console.log(
+        c.green(
+          `  [OK] Compacted: ${before} -> ${history.length} messages.\n`
+        )
+      );
       continue;
     }
 
-    // ── /status ──
+    // -- /status --
     if (input === "/status") {
       const totalUsed = history.reduce((acc, msg) => {
-        const content =
-          typeof msg.content === "string"
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content.map((p) => ("text" in p ? p.text : "")).join("")
-              : "";
-        return acc + estimateTokens(content);
+        return acc + estimateTokens(getMessageContent(msg));
       }, 0);
-      console.log([
-        "",
-        c.bold("  Session:"),
-        `    Provider:   ${PROVIDERS[state.provider].name}`,
-        `    Model:      ${state.model}`,
-        `    Intensity:  ${state.intensity.toUpperCase()}`,
-        `    Messages:   ${history.length}`,
-        `    Tokens:     ${totalUsed.toLocaleString()} / ${CONTEXT_WINDOW.toLocaleString()}`,
-        renderUsageBar(totalUsed, CONTEXT_WINDOW),
-        "",
-      ].join("\n"));
+      console.log(
+        [
+          "",
+          c.bold("  Session:"),
+          `    Provider:   ${PROVIDERS[state.provider].name}`,
+          `    Model:      ${state.model}`,
+          `    Intensity:  ${state.intensity.toUpperCase()}`,
+          `    Messages:   ${history.length}`,
+          `    Tokens:     ${totalUsed.toLocaleString()} / ${CONTEXT_WINDOW.toLocaleString()}`,
+          renderUsageBar(totalUsed, CONTEXT_WINDOW),
+          "",
+        ].join("\n")
+      );
       continue;
     }
 
-    // ── /models ──
+    // -- /models --
     if (input === "/models") {
       try {
         const res = await state.client.models.list();
@@ -1097,18 +1401,31 @@ async function run(
           .map((m) => m.id)
           .filter((id) => PROVIDERS[state.provider].models.test(id))
           .sort();
-        console.log(c.bold(`\n  ${PROVIDERS[state.provider].name} Models:`));
-        models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
-        const choice = await ask(`\n  Select (0-${models.length - 1}): `);
+        console.log(
+          c.bold(`\n  ${PROVIDERS[state.provider].name} Models:`)
+        );
+        models.forEach((m, i) =>
+          console.log(`    ${c.dim(`[${i}]`)} ${m}`)
+        );
+        const choice = await ask(
+          `\n  Select (0-${models.length - 1}): `
+        );
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
           const newModel = sanitizeModelId(models[idx]);
           state.model = newModel;
-          console.log(c.green(`  ✔ ${newModel}\n`));
+          console.log(c.green(`  [OK] ${newModel}\n`));
           const config = loadConfig();
           config.defaultModel = newModel;
           saveConfig(config);
-          history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
+          history[0] = {
+            role: "system",
+            content: getSystemPrompt(
+              state.intensity,
+              process.cwd(),
+              state.provider
+            ),
+          };
         }
       } catch {
         console.log(c.red("  Could not fetch models."));
@@ -1116,7 +1433,7 @@ async function run(
       continue;
     }
 
-    // ── /provider ──
+    // -- /provider --
     if (input === "/provider") {
       console.log(c.bold("  Switch provider:"));
       console.log(`    ${c.dim("[1]")} Groq`);
@@ -1125,66 +1442,85 @@ async function run(
       const newProvider: Provider = pChoice === "2" ? "cerebras" : "groq";
 
       if (newProvider === state.provider) {
-        console.log(c.yellow(`  Already using ${PROVIDERS[state.provider].name}.\n`));
+        console.log(
+          c.yellow(
+            `  Already using ${PROVIDERS[state.provider].name}.\n`
+          )
+        );
         continue;
       }
 
-      console.log(c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`));
+      console.log(
+        c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`)
+      );
       const key = await ask("  API Key: ");
       if (!key || key.length < 10) {
         console.log(c.red("  Invalid key. Provider not changed.\n"));
         continue;
       }
 
-      // Create new client
       const newClient = new OpenAI({
         baseURL: PROVIDERS[newProvider].baseURL,
         apiKey: key,
       });
 
-      // Test connection
       try {
-        console.log(c.dim(`  Connecting to ${PROVIDERS[newProvider].name}...`));
+        console.log(
+          c.dim(`  Connecting to ${PROVIDERS[newProvider].name}...`)
+        );
         await newClient.models.list();
 
-        // Success — update state
         state.client = newClient;
         state.provider = newProvider;
         state.model = PROVIDERS[newProvider].defaultModel;
 
-        // Save config
         const config = loadConfig();
         config.provider = newProvider;
         config.apiKey = key;
         config.defaultModel = state.model;
         saveConfig(config);
 
-        // Update system prompt
-        history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
+        history[0] = {
+          role: "system",
+          content: getSystemPrompt(
+            state.intensity,
+            process.cwd(),
+            state.provider
+          ),
+        };
 
-        console.log(c.green(`  ✔ Switched to ${PROVIDERS[newProvider].name} | ${state.model}\n`));
+        console.log(
+          c.green(
+            `  [OK] Switched to ${PROVIDERS[newProvider].name} | ${state.model}\n`
+          )
+        );
         logActivity(`Switched to ${PROVIDERS[newProvider].name}`);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : "Connection failed";
-        console.error(c.red(`  ✘ ${PROVIDERS[newProvider].name}: ${msg}\n`));
+        const msg =
+          err instanceof Error ? err.message : "Connection failed";
+        console.error(
+          c.red(`  [ERROR] ${PROVIDERS[newProvider].name}: ${msg}\n`)
+        );
       }
       continue;
     }
 
-    // ── /settings ──
+    // -- /settings --
     if (input === "/settings") {
       const config = loadConfig();
-      console.log([
-        "",
-        c.bold("  Settings:"),
-        `    ${c.dim("[1]")} Change API Key`,
-        `    ${c.dim("[2]")} Switch Provider (${PROVIDERS[config.provider || "groq"].name})`,
-        `    ${c.dim("[3]")} Change Model (${config.defaultModel || "default"})`,
-        `    ${c.dim("[4]")} Change Intensity (${(config.intensity || "medium").toUpperCase()})`,
-        `    ${c.dim("[5]")} View Config`,
-        `    ${c.dim("[6]")} Reset All`,
-        "",
-      ].join("\n"));
+      console.log(
+        [
+          "",
+          c.bold("  Settings:"),
+          `    ${c.dim("[1]")} Change API Key`,
+          `    ${c.dim("[2]")} Switch Provider (${PROVIDERS[config.provider || "groq"].name})`,
+          `    ${c.dim("[3]")} Change Model (${config.defaultModel || "default"})`,
+          `    ${c.dim("[4]")} Change Intensity (${(config.intensity || "medium").toUpperCase()})`,
+          `    ${c.dim("[5]")} View Config`,
+          `    ${c.dim("[6]")} Reset All`,
+          "",
+        ].join("\n")
+      );
 
       const setting = await ask("  Select (1-6): ");
 
@@ -1194,7 +1530,7 @@ async function run(
           if (key && key.length > 10) {
             config.apiKey = key;
             saveConfig(config);
-            console.log(c.green("  ✔ API key updated.\n"));
+            console.log(c.green("  [OK] API key updated.\n"));
           }
           break;
         }
@@ -1203,10 +1539,15 @@ async function run(
           console.log(`    ${c.dim("[2]")} Cerebras`);
           const p = await ask("  Select: ");
           config.provider = p === "2" ? "cerebras" : "groq";
-          config.apiKey = ""; // force re-entry
-          config.defaultModel = PROVIDERS[config.provider || "groq"].defaultModel;
+          config.apiKey = "";
+          config.defaultModel =
+            PROVIDERS[config.provider || "groq"].defaultModel;
           saveConfig(config);
-          console.log(c.green(`  ✔ Provider: ${PROVIDERS[config.provider || "groq"].name}. Restart to apply.\n`));
+          console.log(
+            c.green(
+              `  [OK] Provider: ${PROVIDERS[config.provider || "groq"].name}. Restart to apply.\n`
+            )
+          );
           break;
         }
         case "3": {
@@ -1218,16 +1559,24 @@ async function run(
             const res = await client.models.list();
             const models = res.data
               .map((m) => m.id)
-              .filter((id) => PROVIDERS[config.provider || "groq"].models.test(id))
+              .filter((id) =>
+                PROVIDERS[config.provider || "groq"].models.test(id)
+              )
               .sort();
             console.log(c.bold("\n  Models:"));
-            models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
-            const choice = await ask(`\n  Select (0-${models.length - 1}): `);
+            models.forEach((m, i) =>
+              console.log(`    ${c.dim(`[${i}]`)} ${m}`)
+            );
+            const choice = await ask(
+              `\n  Select (0-${models.length - 1}): `
+            );
             const idx = parseInt(choice, 10);
             if (!isNaN(idx) && idx >= 0 && idx < models.length) {
               config.defaultModel = models[idx];
               saveConfig(config);
-              console.log(c.green(`  ✔ Model: ${models[idx]}\n`));
+              console.log(
+                c.green(`  [OK] Model: ${models[idx]}\n`)
+              );
             }
           } catch {
             console.log(c.red("  Could not fetch models."));
@@ -1239,30 +1588,54 @@ async function run(
           console.log(`    ${c.dim("[2]")} Medium`);
           console.log(`    ${c.dim("[3]")} High`);
           const iChoice = await ask("  Select: ");
-          const map: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
+          const map: Record<string, Intensity> = {
+            "1": "low",
+            "2": "medium",
+            "3": "high",
+          };
           if (map[iChoice]) {
             config.intensity = map[iChoice];
             saveConfig(config);
-            console.log(c.green(`  ✔ Intensity: ${config.intensity.toUpperCase()}\n`));
+            console.log(
+              c.green(
+                `  [OK] Intensity: ${config.intensity.toUpperCase()}\n`
+              )
+            );
           }
           break;
         }
         case "5": {
           console.log("");
           console.log(c.bold("  Current config:"));
-          console.log(`    Provider:   ${PROVIDERS[config.provider || "groq"].name}`);
-          console.log(`    Model:      ${config.defaultModel || "default"}`);
-          console.log(`    Intensity:  ${(config.intensity || "medium").toUpperCase()}`);
-          console.log(`    API Key:    ${config.apiKey ? config.apiKey.slice(0, 6) + "..." + config.apiKey.slice(-4) : "not set"}`);
+          console.log(
+            `    Provider:   ${PROVIDERS[config.provider || "groq"].name}`
+          );
+          console.log(
+            `    Model:      ${config.defaultModel || "default"}`
+          );
+          console.log(
+            `    Intensity:  ${(config.intensity || "medium").toUpperCase()}`
+          );
+          console.log(
+            `    API Key:    ${config.apiKey ? config.apiKey.slice(0, 6) + "..." + config.apiKey.slice(-4) : "not set"}`
+          );
           console.log(`    Config:     ${CONFIG_PATH}`);
           console.log("");
           break;
         }
         case "6": {
-          const confirm = await ask(c.yellow("  Are you sure? (yes/no): "));
+          const confirm = await ask(
+            c.yellow("  Are you sure? (yes/no): ")
+          );
           if (confirm.toLowerCase() === "yes") {
-            try { fs.unlinkSync(CONFIG_PATH); } catch { /* ok */ }
-            console.log(c.green("  ✔ Config reset. Restart to apply.\n"));
+            try {
+              fs.unlinkSync(CONFIG_PATH);
+            } catch {
+              /* ok */
+            }
+            console.log(
+              c.green("  [OK] Config reset. Restart to apply.\n")
+            );
           }
           break;
         }
@@ -1270,7 +1643,7 @@ async function run(
       continue;
     }
 
-    // ── /search ──
+    // -- /search --
     if (input.startsWith("/search ")) {
       const query = input.slice(8).trim();
       if (!query) {
@@ -1281,9 +1654,10 @@ async function run(
       const results = await searchWeb(query);
       console.log(formatSearchResults(results, query));
 
-      // Feed results into context
       const resultText = results
-        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`)
+        .map(
+          (r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`
+        )
         .join("\n\n");
 
       history.push({
@@ -1293,7 +1667,7 @@ async function run(
       continue;
     }
 
-    // ── /fetch ──
+    // -- /fetch --
     if (input.startsWith("/fetch ")) {
       const url = input.slice(7).trim();
       if (!url || !url.startsWith("http")) {
@@ -1303,7 +1677,11 @@ async function run(
       console.log(c.dim(`  Fetching: ${url}...`));
       const content = await fetchUrlContent(url);
       console.log(`\n${c.dim(content.slice(0, 3000))}`);
-      if (content.length > 3000) console.log(c.dim(`\n  ... (${content.length} chars total)`));
+      if (content.length > 3000) {
+        console.log(
+          c.dim(`\n  ... (${content.length} chars total)`)
+        );
+      }
       console.log("");
 
       history.push({
@@ -1313,16 +1691,25 @@ async function run(
       continue;
     }
 
-    // ── /write <filepath> ──
+    // -- /write <filepath> --
     if (input.startsWith("/write ")) {
-      const filepath = input.slice(7).trim().replace(/^['"]|['"]$/g, "");
+      const filepath = input
+        .slice(7)
+        .trim()
+        .replace(/^['"]|['"]$/g, "");
       if (!filepath) {
         console.log(c.yellow("  Usage: /write <filepath>"));
-        console.log(c.dim("  Then paste or type content, end with a line containing only '---'"));
+        console.log(
+          c.dim(
+            "  Then paste or type content, end with a line containing only '---'"
+          )
+        );
         continue;
       }
       console.log(c.dim(`  Writing to: ${filepath}`));
-      console.log(c.dim("  Paste/type content. End with a line containing only '---':"));
+      console.log(
+        c.dim("  Paste/type content. End with a line containing only '---':")
+      );
       const lines: string[] = [];
       while (true) {
         const line = await ask(c.dim("  | "));
@@ -1341,72 +1728,101 @@ async function run(
           fs.mkdirSync(dir, { recursive: true });
         }
         fs.writeFileSync(target, content, "utf-8");
-        console.log(c.green(`  ✔ Created: ${path.relative(process.cwd(), target)} (${content.length} chars)\n`));
+        const rel = path.relative(process.cwd(), target);
+        console.log(
+          c.green(
+            `  [OK] Created: ${rel} (${content.length} chars)\n`
+          )
+        );
         logActivity(`Created: ${path.basename(target)}`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Write failed";
-        console.error(c.red(`  ✘ ${msg}\n`));
+        console.error(c.red(`  [ERROR] ${msg}\n`));
       }
       continue;
     }
 
-    // ── Native cd ──
+    // -- Native cd --
     if (input === "cd" || input === "cd ~" || input === "cd $HOME") {
       const home = os.homedir();
       try {
         process.chdir(home);
-        console.log(c.green(`  ✔ ${home}\n`));
+        console.log(c.green(`  [OK] ${home}\n`));
         const tree = scanDirectory(home, 3);
         if (tree) {
           console.log(c.dim("  Directory:"));
           console.log(c.dim(tree) + "\n");
         }
-        history[0] = { role: "system", content: getSystemPrompt(state.intensity, home, state.provider) };
+        history[0] = {
+          role: "system",
+          content: getSystemPrompt(state.intensity, home, state.provider),
+        };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(c.red(`  ✘ ${msg}`));
+        console.error(c.red(`  [ERROR] ${msg}`));
       }
       continue;
     }
 
     if (input.startsWith("cd ")) {
-      const raw = input.slice(3).replace(/^['"]|['"]$/g, "").trim();
+      const raw = input
+        .slice(3)
+        .replace(/^['"]|['"]$/g, "")
+        .trim();
       if (!raw || raw.includes("\0")) {
-        console.error(c.red("  ✘ Invalid path."));
+        console.error(c.red("  [ERROR] Invalid path."));
         continue;
       }
       try {
         const target = path.resolve(raw);
         process.chdir(target);
         const newCwd = process.cwd();
-        console.log(c.green(`  ✔ ${newCwd}\n`));
+        console.log(c.green(`  [OK] ${newCwd}\n`));
         const tree = scanDirectory(newCwd, 3);
         if (tree) {
           console.log(c.dim("  Directory:"));
           console.log(c.dim(tree) + "\n");
         }
-        history[0] = { role: "system", content: getSystemPrompt(state.intensity, newCwd, state.provider) };
+        history[0] = {
+          role: "system",
+          content: getSystemPrompt(
+            state.intensity,
+            newCwd,
+            state.provider
+          ),
+        };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(c.red(`  ✘ ${msg}`));
-        console.log(c.dim("  Tip: use full paths like C:\\Users\\name\\project or /home/user/project"));
+        console.error(c.red(`  [ERROR] ${msg}`));
+        console.log(
+          c.dim(
+            "  Tip: use full paths like C:\\Users\\name\\project or /home/user/project"
+          )
+        );
       }
       continue;
     }
 
-    // ── Update system prompt ──
-    history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
+    // -- Update system prompt --
+    history[0] = {
+      role: "system",
+      content: getSystemPrompt(
+        state.intensity,
+        process.cwd(),
+        state.provider
+      ),
+    };
 
-    // ── Auto-search: if the input likely needs external data ──
+    // -- Auto-search --
     let finalInput = input;
     if (needsWebSearch(input)) {
-      console.log(c.dim("  🔍 Auto-searching for current data..."));
+      console.log(c.dim("  Auto-searching for current data..."));
       const searchResults = await searchWeb(input, 3);
       if (searchResults.length > 0) {
         const searchContext = searchResults
           .map((r) => `- ${r.title}: ${r.snippet} (${r.url})`)
           .join("\n");
-        finalInput = `${input}\n\n[Web search results — use this context to answer accurately:]\n${searchContext}`;
+        finalInput = `${input}\n\n[Web search results -- use this context to answer accurately:]\n${searchContext}`;
         logActivity(`Searched: ${input.slice(0, 50)}`);
       }
     }
@@ -1418,12 +1834,22 @@ async function run(
     const trimmed = trimHistory(history);
 
     // Temperature
-    const temp = state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.2 : 0.4;
+    const temp =
+      state.intensity === "low"
+        ? 0.0
+        : state.intensity === "medium"
+          ? 0.2
+          : 0.4;
 
     // Stream response
     try {
-      process.stdout.write(c.dim("  ⏳ Thinking...\r"));
-      const { content: reply, usage } = await streamResponse(state.client, state.model, trimmed, temp);
+      process.stdout.write(c.dim("  Thinking...\r"));
+      const { content: reply, usage } = await streamResponse(
+        state.client,
+        state.model,
+        trimmed,
+        temp
+      );
 
       if (!reply) {
         console.log(c.red("  No response."));
@@ -1439,8 +1865,11 @@ async function run(
       // Auto-write files from code blocks
       const files = extractFilesFromResponse(reply, process.cwd());
       if (files.length > 0) {
-        console.log(c.bold("  Writing files:"));
-        writeFiles(files);
+        console.log(c.bold("  Auto-writing detected files:"));
+        const wrote = writeFiles(files);
+        if (wrote) {
+          logActivity(`Auto-wrote ${files.length} file(s)`);
+        }
         console.log("");
       }
 
@@ -1449,13 +1878,13 @@ async function run(
       const cwd = process.cwd();
 
       for (const block of blocks) {
-        console.log(c.dim(`  ▸ ${block}`));
+        console.log(c.dim(`  > ${block}`));
         const result = await execShellStreaming(block, cwd);
         if (result.ok) {
-          console.log(c.green("  ✔ Done.\n"));
+          console.log(c.green("  [OK] Done.\n"));
           logActivity(`Ran: ${block.slice(0, 60)}`);
         } else {
-          console.log(c.red("  ✘ Failed.\n"));
+          console.log(c.red("  [FAIL] Failed.\n"));
           logActivity(`Failed: ${block.slice(0, 60)}`);
         }
         history.push({
@@ -1471,22 +1900,31 @@ async function run(
       const msg = err instanceof Error ? err.message : String(err);
 
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
-        console.error(c.red(`  ✘ Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`));
+        console.error(
+          c.red(
+            `  [ERROR] Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`
+          )
+        );
       } else if (msg.includes("404") || msg.includes("does not exist")) {
-        console.error(c.red(`  ✘ Model '${state.model}' not found.`));
+        console.error(
+          c.red(`  [ERROR] Model '${state.model}' not found.`)
+        );
         console.log(c.dim("  Type /models to re-select a valid model."));
-        // Reset to default
         state.model = PROVIDERS[state.provider].defaultModel;
         const config = loadConfig();
         config.defaultModel = state.model;
         saveConfig(config);
-        console.log(c.green(`  ✔ Default: ${state.model}\n`));
+        console.log(c.green(`  [OK] Default: ${state.model}\n`));
       } else if (msg.includes("429")) {
-        console.error(c.yellow("  ⚠ Rate limited. Wait a moment."));
+        console.error(
+          c.yellow("  Rate limited. Wait a moment.")
+        );
       } else if (msg.includes("503")) {
-        console.error(c.yellow("  ⚠ Model overloaded. Try again."));
+        console.error(
+          c.yellow("  Model overloaded. Try again.")
+        );
       } else {
-        console.error(c.red(`  ✘ ${msg}`));
+        console.error(c.red(`  [ERROR] ${msg}`));
       }
       history.pop();
     }
@@ -1512,11 +1950,11 @@ function main(): void {
   });
 
   process.on("unhandledRejection", (err) => {
-    console.error(c.red(`\n  ✘ Unhandled: ${err}`));
+    console.error(c.red(`\n  [UNHANDLED] ${err}`));
   });
 
   process.on("uncaughtException", (err) => {
-    console.error(c.red(`\n  ✘ Uncaught: ${err.message}`));
+    console.error(c.red(`\n  [UNCAUGHT] ${err.message}`));
     process.exit(1);
   });
 
@@ -1524,17 +1962,26 @@ function main(): void {
 
   setup()
     .then(async ({ client, model, intensity, provider }) => {
-      // Ask for working directory
       console.log(c.dim(`  Current directory: ${process.cwd()}`));
-      const dirInput = await ask(c.bold("  Project directory (Enter to skip): "));
+      const dirInput = await ask(
+        c.bold("  Project directory (Enter to skip): ")
+      );
       if (dirInput.trim()) {
-        const cleaned = dirInput.trim().replace(/^['"]|['"]$/g, "");
+        const cleaned = dirInput
+          .trim()
+          .replace(/^['"]|['"]$/g, "");
         const target = path.resolve(cleaned);
         try {
           process.chdir(target);
-          console.log(c.green(`  ✔ Switched to: ${process.cwd()}\n`));
+          console.log(
+            c.green(`  [OK] Switched to: ${process.cwd()}\n`)
+          );
         } catch {
-          console.log(c.yellow(`  ⚠ Could not open '${target}'. Using current.\n`));
+          console.log(
+            c.yellow(
+              `  Could not open '${target}'. Using current.\n`
+            )
+          );
         }
       }
 
@@ -1544,16 +1991,26 @@ function main(): void {
       if (hasSavedSession()) {
         const session = loadSession();
         if (session) {
-          console.log(c.dim(`  📂 Last session: ${formatSessionAge(session.timestamp)} — type /resume to continue`));
+          console.log(
+            c.dim(
+              `  Last session: ${formatSessionAge(session.timestamp)} -- type /resume to continue`
+            )
+          );
         }
       }
-      console.log(c.green("  🎉 Ready! Type /cmds for commands, /help for help.\n"));
+      console.log(
+        c.green(
+          "  Ready! Type /cmds for commands, /help for help.\n"
+        )
+      );
 
       logActivity("Started session");
       return run(client, model, intensity, provider);
     })
     .catch((err) => {
-      console.error(c.red(`\n  ✘ Fatal: ${err.message || err}`));
+      console.error(
+        c.red(`\n  [FATAL] ${err.message || err}`)
+      );
       process.exit(1);
     });
 }

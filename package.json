@@ -1,19 +1,42 @@
 {
   "name": "flow-code",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "description": "Lightning-fast terminal coding agent powered by Groq and Cerebras. Open-source alternative to Claude Code.",
   "type": "module",
+  "main": "./dist/cli.js",
   "bin": {
     "flow-code": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
-    "start": "tsc && node ./dist/cli.js"
+    "start": "tsc && node ./dist/cli.js",
+    "postinstall": "tsc || true"
   },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "terminal",
+    "groq",
+    "cerebras",
+    "llm",
+    "code-generation",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "openai": "^4.28.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.3.3"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }
