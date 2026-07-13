@@ -14,8 +14,8 @@ import { spawn } from "child_process";
 const CONFIG_PATH = path.join(os.homedir(), ".flow-code-config");
 const SESSION_PATH = path.join(os.homedir(), ".flow-code-session");
 const CONTEXT_WINDOW = 128000;
-const MAX_HISTORY_TOKENS = 110000;
-const MAX_RESPONSE_TOKENS = 16384;
+const MAX_HISTORY_TOKENS = 8000;
+const MAX_RESPONSE_TOKENS = 4096;
 
 const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
@@ -564,33 +564,15 @@ function formatResponse(text: string): string {
 // ---------------------------------------------------------------------------
 
 function getSystemPrompt(intensity: Intensity, cwd: string, provider: Provider): string {
-  const descriptions: Record<Intensity, string> = {
-    low: "Fast, single-file patches.",
-    medium: "Standard refactoring, verify changes.",
-    high: "Deep scan, lint, test, optimize.",
-  };
-
-  const dirTree = scanDirectory(cwd, 1);
   const providerName = PROVIDERS[provider].name;
+  const dirTree = scanDirectory(cwd, 1);
 
   return [
-    `You are FLOW CODE (${providerName}). Principal engineer level code.`,
-    `CWD: ${cwd} | Intensity: ${intensity.toUpperCase()} — ${descriptions[intensity]}`,
-    "",
-    "Directory:",
-    dirTree || "(empty)",
-    "",
-    "Rules:",
-    "- Read files before modifying. Match existing style.",
-    "- TypeScript: no any, interfaces, async/await, const, early returns.",
-    "- React: functional components, hooks, TypeScript props.",
-    "- HTML: semantic elements, flexbox/grid, responsive.",
-    "- Python: type hints, PEP 8, f-strings.",
-    "- Bash: set -euo pipefail, quote variables, --yes flags.",
-    "- Write complete files. mkdir -p for dirs. Edit over create.",
-    "- Fenced code blocks with language tags.",
-    "- On error, analyze and fix — don't just report.",
-  ].join("\n");
+    `FLOW CODE (${providerName}). Write production code.`,
+    `CWD: ${cwd}`,
+    dirTree ? `Files: ${dirTree}` : "",
+    "Rules: read before modify. TS: no any, interfaces. React: functional, hooks. HTML: semantic, responsive. Bash: set -euo pipefail. Complete files only. Fenced code blocks.",
+  ].filter(Boolean).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -803,43 +785,72 @@ async function streamResponse(
   client: OpenAI,
   model: string,
   messages: Message[],
-  temperature: number
+  temperature: number,
+  retries: number = 2
 ): Promise<{ content: string; usage: UsageInfo }> {
-  const stream = await client.chat.completions.create({
-    model,
-    messages,
-    temperature,
-    top_p: 0.95,
-    max_tokens: MAX_RESPONSE_TOKENS,
-    stream: true,
-    stream_options: { include_usage: true },
-  });
+  let lastError: unknown;
 
-  let fullResponse = "";
-  let usage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
-  let started = false;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const stream = await client.chat.completions.create({
+        model,
+        messages,
+        temperature,
+        top_p: 0.95,
+        max_tokens: MAX_RESPONSE_TOKENS,
+        stream: true,
+        stream_options: { include_usage: true },
+      });
 
-  for await (const chunk of stream) {
-    if (chunk.usage) {
-      usage = {
-        promptTokens: chunk.usage.prompt_tokens,
-        completionTokens: chunk.usage.completion_tokens,
-        totalTokens: chunk.usage.total_tokens,
-      };
-    }
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) {
-      if (!started) {
-        process.stdout.write(" ".repeat(30) + "\r");
-        started = true;
+      let fullResponse = "";
+      let usage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      let started = false;
+
+      for await (const chunk of stream) {
+        if (chunk.usage) {
+          usage = {
+            promptTokens: chunk.usage.prompt_tokens,
+            completionTokens: chunk.usage.completion_tokens,
+            totalTokens: chunk.usage.total_tokens,
+          };
+        }
+        const delta = chunk.choices[0]?.delta?.content;
+        if (delta) {
+          if (!started) {
+            process.stdout.write(" ".repeat(30) + "\r");
+            started = true;
+          }
+          process.stdout.write(delta);
+          fullResponse += delta;
+        }
       }
-      process.stdout.write(delta);
-      fullResponse += delta;
+
+      process.stdout.write("\n");
+      return { content: fullResponse, usage };
+    } catch (err: unknown) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (msg.includes("429") && attempt < retries) {
+        process.stdout.write(" ".repeat(30) + "\r");
+        const wait = (attempt + 1) * 5;
+        console.log(c.yellow(`  ⚠ Rate limited. Retrying in ${wait}s...`));
+        await new Promise((r) => setTimeout(r, wait * 1000));
+        process.stdout.write(c.dim("  ⏳ Thinking...\r"));
+        continue;
+      }
+
+      if (msg.includes("413") || msg.includes("too large")) {
+        process.stdout.write(" ".repeat(30) + "\r");
+        console.log(c.yellow("  ⚠ Request too large. Try a shorter message or /compact to clear history."));
+        throw err;
+      }
+
+      throw err;
     }
   }
 
-  process.stdout.write("\n");
-  return { content: fullResponse, usage };
+  throw lastError;
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,7 +1326,7 @@ async function run(
         }
         history.push({
           role: "user",
-          content: `Terminal output:\n${result.output.slice(0, 8000)}`,
+          content: `Terminal output:\n${result.output.slice(0, 2000)}`,
         });
       }
 
