@@ -12,6 +12,7 @@ import { spawn } from "child_process";
 // ---------------------------------------------------------------------------
 
 const CONFIG_PATH = path.join(os.homedir(), ".flow-code-config");
+const SESSION_PATH = path.join(os.homedir(), ".flow-code-session");
 const CONTEXT_WINDOW = 128000;
 const MAX_HISTORY_TOKENS = 110000;
 const MAX_RESPONSE_TOKENS = 16384;
@@ -267,6 +268,67 @@ function timeAgo(ts: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Session save / load (for /resume)
+// ---------------------------------------------------------------------------
+
+interface SessionData {
+  history: Array<{ role: string; content: string }>;
+  model: string;
+  provider: Provider;
+  intensity: Intensity;
+  cwd: string;
+  timestamp: number;
+}
+
+function saveSession(
+  history: Message[],
+  model: string,
+  provider: Provider,
+  intensity: Intensity
+): void {
+  try {
+    const data: SessionData = {
+      history: history.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : "",
+      })),
+      model,
+      provider,
+      intensity,
+      cwd: process.cwd(),
+      timestamp: Date.now(),
+    };
+    fs.writeFileSync(SESSION_PATH, JSON.stringify(data, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } catch { /* ignore */ }
+}
+
+function loadSession(): SessionData | null {
+  try {
+    if (fs.existsSync(SESSION_PATH)) {
+      return JSON.parse(fs.readFileSync(SESSION_PATH, "utf-8")) as SessionData;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function hasSavedSession(): boolean {
+  return loadSession() !== null;
+}
+
+function formatSessionAge(ts: number): string {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+// ---------------------------------------------------------------------------
 // Banner + Dashboard
 // ---------------------------------------------------------------------------
 
@@ -329,8 +391,9 @@ function printDashboard(config: Config): void {
   console.log(`  ${c.dim("│")}`);
   console.log(`  ${c.dim("│")}  ${c.dim("What's new:")}`);
   console.log(`  ${c.dim("│")}  ${c.dim("/search")} to search the web`);
+  console.log(`  ${c.dim("│")}  ${c.dim("/resume")} to continue last conversation`);
+  console.log(`  ${c.dim("│")}  ${c.dim("/cmds")} to see all commands`);
   console.log(`  ${c.dim("│")}  ${c.dim("/settings")} to configure preferences`);
-  console.log(`  ${c.dim("│")}  ${c.dim("/provider")} to switch Groq / Cerebras`);
   console.log(`  ${c.dim("│")}  ${c.dim("Ctrl+C to exit")}`);
   console.log(`  ${c.dim("└")}${hline}`);
   console.log("");
@@ -876,10 +939,12 @@ async function run(
         `    ${c.dim("/search <query>")}  Search the web`,
         `    ${c.dim("/fetch <url>")}     Fetch URL content`,
         `    ${c.dim("/settings")}        Configure preferences`,
-        `    ${c.dim("/clear")}           Reset conversation`,
-        `    ${c.dim("/compact")}         Trim context`,
         `    ${c.dim("/models")}          Re-select model`,
         `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
+        `    ${c.dim("/resume")}          Resume last conversation`,
+        `    ${c.dim("/clear")}           Reset conversation`,
+        `    ${c.dim("/compact")}         Trim context`,
+        `    ${c.dim("/cmds")}            List all commands`,
         `    ${c.dim("/status")}          Show usage stats`,
         `    ${c.dim("exit")}             Quit`,
         "",
@@ -895,6 +960,72 @@ async function run(
       history.length = 1;
       history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
       console.log(c.green("  ✔ Conversation cleared.\n"));
+      continue;
+    }
+
+    // ── /resume ──
+    if (input === "/resume") {
+      const session = loadSession();
+      if (!session) {
+        console.log(c.yellow("  No saved session found. Start a conversation first.\n"));
+        continue;
+      }
+      // Restore history
+      history.length = 0;
+      for (const msg of session.history) {
+        history.push({ role: msg.role as "system" | "user" | "assistant", content: msg.content });
+      }
+      // Restore cwd
+      if (session.cwd && fs.existsSync(session.cwd)) {
+        process.chdir(session.cwd);
+        history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+      }
+      const msgCount = history.filter((m) => m.role === "user" || m.role === "assistant").length;
+      console.log(c.green(`  ✔ Resumed ${msgCount} messages from ${formatSessionAge(session.timestamp)}.\n`));
+      console.log(c.dim(`  Model: ${session.model} | Provider: ${PROVIDERS[session.provider || "groq"].name}\n`));
+      continue;
+    }
+
+    // ── /cmds ──
+    if (input === "/cmds") {
+      console.log([
+        "",
+        c.bold(c.blue("  Flow Code Commands")),
+        c.dim("  ─────────────────────────────────────────────"),
+        "",
+        c.bold("  Navigation:"),
+        `    ${c.cyan("cd <path>")}            Switch working directory`,
+        `    ${c.cyan("cd ..")}                Go up one directory`,
+        `    ${c.cyan("cd ~")}                 Go to home directory`,
+        "",
+        c.bold("  Web & Search:"),
+        `    ${c.cyan("/search <query>")}      Search the web via DuckDuckGo`,
+        `    ${c.cyan("/fetch <url>")}         Fetch and display URL content`,
+        "",
+        c.bold("  Session Management:"),
+        `    ${c.cyan("/resume")}              Resume last conversation`,
+        `    ${c.cyan("/clear")}               Reset conversation history`,
+        `    ${c.cyan("/compact")}             Trim history to fit context`,
+        "",
+        c.bold("  Configuration:"),
+        `    ${c.cyan("/settings")}            Open interactive settings menu`,
+        `    ${c.cyan("/models")}              Re-select your model`,
+        `    ${c.cyan("/provider")}            Switch between Groq / Cerebras`,
+        "",
+        c.bold("  Information:"),
+        `    ${c.cyan("/status")}              Show provider, model, tokens`,
+        `    ${c.cyan("/cmds")}                Show this command list`,
+        `    ${c.cyan("/help")}                Show condensed help`,
+        "",
+        c.bold("  Exit:"),
+        `    ${c.cyan("exit")}                 Quit Flow Code`,
+        `    ${c.cyan("quit")}                 Quit Flow Code`,
+        `    ${c.cyan("Ctrl+C")}               Quit Flow Code`,
+        "",
+        c.dim("  Multiline: end a line with \\ to continue."),
+        c.dim("  Auto-search: detects when queries need web data."),
+        "",
+      ].join("\n"));
       continue;
     }
 
@@ -1209,6 +1340,9 @@ async function run(
           content: `Terminal output:\n${result.output.slice(0, 8000)}`,
         });
       }
+
+      // Auto-save session for /resume
+      saveSession(history, model, provider, intensity);
     } catch (err: unknown) {
       process.stdout.write(" ".repeat(30) + "\r");
       const msg = err instanceof Error ? err.message : String(err);
@@ -1260,6 +1394,17 @@ function main(): void {
     .then(({ client, model, intensity, provider }) => {
       const config = loadConfig();
       printDashboard(config);
+
+      // Show login success message
+      console.log(c.green("  🎉 Login successful. Press Enter to continue."));
+      if (hasSavedSession()) {
+        const session = loadSession();
+        if (session) {
+          console.log(c.dim(`  📂 Last session: ${formatSessionAge(session.timestamp)} — type /resume to continue`));
+        }
+      }
+      console.log("");
+
       logActivity("Started session");
       return run(client, model, intensity, provider);
     })
