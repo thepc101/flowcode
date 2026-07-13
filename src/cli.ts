@@ -653,7 +653,7 @@ async function setup(): Promise<{
     config.provider = provider;
     saveConfig(config);
   } else {
-    provider = config.provider;
+    provider = config.provider || "groq";
   }
 
   const client = new OpenAI({
@@ -1015,9 +1015,9 @@ async function run(
           const p = await ask("  Select: ");
           config.provider = p === "2" ? "cerebras" : "groq";
           config.apiKey = ""; // force re-entry
-          config.defaultModel = PROVIDERS[config.provider].defaultModel;
+          config.defaultModel = PROVIDERS[config.provider || "groq"].defaultModel;
           saveConfig(config);
-          console.log(c.green(`  ✔ Provider: ${PROVIDERS[config.provider].name}. Restart to apply.\n`));
+          console.log(c.green(`  ✔ Provider: ${PROVIDERS[config.provider || "groq"].name}. Restart to apply.\n`));
           break;
         }
         case "3": {
