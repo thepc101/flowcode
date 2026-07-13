@@ -49,8 +49,10 @@ On first run you'll be prompted to:
 | `/settings` | Open interactive settings menu |
 | `/models` | Re-select your model |
 | `/provider` | Switch between Groq and Cerebras |
+| `/resume` | Resume last saved conversation |
 | `/compact` | Trim conversation history to fit context |
 | `/clear` | Reset conversation history |
+| `/cmds` | Full categorized command reference |
 | `/status` | Show provider, model, intensity, and token usage |
 | `/help` | List all commands |
 | `exit` | Quit Flow Code |
