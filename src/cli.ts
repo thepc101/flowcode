@@ -741,6 +741,70 @@ function extractBashBlocks(text: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// File writing — auto-detect and manual /write command
+// ---------------------------------------------------------------------------
+
+interface FileToWrite {
+  path: string;
+  content: string;
+}
+
+function extractFilesFromResponse(text: string, cwd: string): FileToWrite[] {
+  const files: FileToWrite[] = [];
+
+  // Pattern 1: ```filename.ext\n...\n``` (code block with filename as first line)
+  const namedBlockRegex = /```(\S+\.\S+)\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+  while ((match = namedBlockRegex.exec(text)) !== null) {
+    const filename = match[1];
+    const content = match[2].trim();
+    // Skip if it looks like a language tag, not a filename
+    if (!/^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php)$/i.test(filename)) {
+      files.push({ path: path.resolve(cwd, filename), content });
+    }
+  }
+
+  // Pattern 2: "create/write/save file <path>" followed by code block
+  const writeFileRegex = /(?:create|write|save|make)\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?[`"']?([^\s`"']+\.\S+)[`"']?\s*(?:with|containing|using)?[\s\S]*?```(\w*)\n([\s\S]*?)```/gi;
+  while ((match = writeFileRegex.exec(text)) !== null) {
+    const filename = match[1];
+    const content = match[3].trim();
+    files.push({ path: path.resolve(cwd, filename), content });
+  }
+
+  // Pattern 3: index.html, style.css, app.js, main.ts, etc. at start of line
+  const standaloneFileRegex = /^(index\.html|style\.css|app\.js|main\.ts|App\.tsx|App\.jsx|page\.tsx|layout\.tsx|globals\.css|package\.ts|tsconfig\.json|\.env\.example|README\.md|server\.py|main\.py|app\.py)\s*(?:\n|$)/gm;
+  while ((match = standaloneFileRegex.exec(text)) !== null) {
+    const filename = match[1];
+    // Find the next code block after this filename
+    const afterFilename = text.slice(match.index + filename.length);
+    const codeMatch = afterFilename.match(/```(\w*)\n([\s\S]*?)```/);
+    if (codeMatch) {
+      files.push({ path: path.resolve(cwd, filename), content: codeMatch[2].trim() });
+    }
+  }
+
+  return files;
+}
+
+function writeFiles(files: FileToWrite[]): void {
+  for (const file of files) {
+    try {
+      const dir = path.dirname(file.path);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(file.path, file.content, "utf-8");
+      console.log(c.green(`  📄 Created: ${path.relative(process.cwd(), file.path)}`));
+      logActivity(`Created: ${path.basename(file.path)}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Write failed";
+      console.error(c.red(`  ✘ Failed to write ${path.basename(file.path)}: ${msg}`));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Auto-search detection
 // ---------------------------------------------------------------------------
 
@@ -894,6 +958,7 @@ async function run(
         `    ${c.dim("cd <path>")}        Switch directory`,
         `    ${c.dim("/search <query>")}  Search the web`,
         `    ${c.dim("/fetch <url>")}     Fetch URL content`,
+        `    ${c.dim("/write <file>")}    Write a file manually`,
         `    ${c.dim("/settings")}        Configure preferences`,
         `    ${c.dim("/models")}          Re-select model`,
         `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
@@ -957,6 +1022,10 @@ async function run(
         c.bold("  Web & Search:"),
         `    ${c.cyan("/search <query>")}      Search the web via DuckDuckGo`,
         `    ${c.cyan("/fetch <url>")}         Fetch and display URL content`,
+        "",
+        c.bold("  Files:"),
+        `    ${c.cyan("/write <file>")}        Write a file manually (paste content)`,
+        `    ${c.dim("Auto-write")}             Code blocks with filenames auto-save`,
         "",
         c.bold("  Session Management:"),
         `    ${c.cyan("/resume")}              Resume last conversation`,
@@ -1244,6 +1313,43 @@ async function run(
       continue;
     }
 
+    // ── /write <filepath> ──
+    if (input.startsWith("/write ")) {
+      const filepath = input.slice(7).trim().replace(/^['"]|['"]$/g, "");
+      if (!filepath) {
+        console.log(c.yellow("  Usage: /write <filepath>"));
+        console.log(c.dim("  Then paste or type content, end with a line containing only '---'"));
+        continue;
+      }
+      console.log(c.dim(`  Writing to: ${filepath}`));
+      console.log(c.dim("  Paste/type content. End with a line containing only '---':"));
+      const lines: string[] = [];
+      while (true) {
+        const line = await ask(c.dim("  | "));
+        if (line.trim() === "---") break;
+        lines.push(line);
+      }
+      const content = lines.join("\n");
+      if (content.length === 0) {
+        console.log(c.yellow("  Empty content. File not written."));
+        continue;
+      }
+      const target = path.resolve(process.cwd(), filepath);
+      try {
+        const dir = path.dirname(target);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(target, content, "utf-8");
+        console.log(c.green(`  ✔ Created: ${path.relative(process.cwd(), target)} (${content.length} chars)\n`));
+        logActivity(`Created: ${path.basename(target)}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "Write failed";
+        console.error(c.red(`  ✘ ${msg}\n`));
+      }
+      continue;
+    }
+
     // ── Native cd ──
     if (input === "cd" || input === "cd ~" || input === "cd $HOME") {
       const home = os.homedir();
@@ -1329,6 +1435,14 @@ async function run(
       if (usage.totalTokens > 0) printUsage(usage, history);
 
       history.push({ role: "assistant", content: reply });
+
+      // Auto-write files from code blocks
+      const files = extractFilesFromResponse(reply, process.cwd());
+      if (files.length > 0) {
+        console.log(c.bold("  Writing files:"));
+        writeFiles(files);
+        console.log("");
+      }
 
       // Execute bash blocks
       const blocks = extractBashBlocks(reply);
