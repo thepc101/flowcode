@@ -166,13 +166,14 @@ async function startAgentLoop(client: OpenAI, history: OpenAI.Chat.Completions.C
 async function main() {
   console.clear();
   console.log("\x1b[34m");
-  console.log("  _____ _               ____                          ");
-  console.log(" |  ___| |_   _ ___ ___|  _ \\ __ _ _ __   __ _        ");
-  console.log(" | |_  | \\ \\ / / __/ __| |_) / _` | '_ \\ / _` |       ");
-  console.log(" |  _| | |\\ V /\\__ \\__ \\  __/ (_| | | | | (_| |       ");
-  console.log(" |_|   |_| \\_/ |___/___/_|   \\__,_|_| |_|\\__, |       ");
-  console.log("                                           |___/        ");
-  console.log("        [FREE & OPEN SOURCE]                            ");
+  console.log("");
+  console.log("  ┌──────────────────────────────────────────┐");
+  console.log("  │                                          │");
+  console.log("  │  \x1b[1m F L O W   C O D E \x1b[0m\x1b[34m                  │");
+  console.log("  │                                          │");
+  console.log("  └──────────────────────────────────────────┘");
+  console.log("        [FREE & OPEN SOURCE]");
+  console.log("");
   console.log("\x1b[0m");
 
   const client = await initializeSetup();
