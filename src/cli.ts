@@ -335,12 +335,12 @@ function formatSessionAge(ts: number): string {
 function printBanner(): void {
   console.clear();
   console.log("");
-  console.log(c.blue("  ┌────────────────────────────────────────┐"));
-  console.log(c.blue("  │                                        │"));
-  console.log(c.blue("  │  ") + c.bold(c.blue("F L O W   C O D E")) + c.blue("                  │"));
-  console.log(c.blue("  │                                        │"));
-  console.log(c.blue("  └────────────────────────────────────────┘"));
-  console.log(c.dim("        [FREE & OPEN SOURCE]"));
+  console.log(c.blue("  ╔══════════════════════════════════════╗"));
+  console.log(c.blue("  ║                                      ║"));
+  console.log(c.blue("  ║   ") + c.bold(c.blue("F L O W   C O D E")) + c.blue("               ║"));
+  console.log(c.blue("  ║                                      ║"));
+  console.log(c.blue("  ╚══════════════════════════════════════╝"));
+  console.log(c.dim("          [FREE & OPEN SOURCE]"));
   console.log("");
 }
 
@@ -351,51 +351,38 @@ function printDashboard(config: Config): void {
   const cwd = process.cwd();
   const activity = getRecentActivity();
 
-  const w = 78;
-  const hline = c.dim("─".repeat(w));
+  const w = 60;
+  const hline = c.dim("-".repeat(w));
 
   console.log("");
-  console.log(`  ${c.dim("───")} ${c.bold(c.blue("Flow Code"))} ${c.dim("v1.0.0")} ${c.dim("─".repeat(w - 28))}`);
-
-  // ── Left panel: Welcome + icon ──
+  console.log(`  ${c.dim("---")} ${c.bold(c.blue("Flow Code"))} ${c.dim("v1.0.0")} ${c.dim("-".repeat(w - 26))}`);
   console.log("");
-  console.log(`  ${c.dim("┌")} ${c.bold("Welcome back!")}`);
-  console.log(`  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("███╗   ███╗")}${c.cyan("██╗   ██╗██╗  ██╗")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("████╗ ████║")}${c.cyan("██║   ██║██║  ██║")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("██╔████╔██║")}${c.cyan("██║   ██║███████║")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("██║╚██╔╝██║")}${c.cyan("██║   ██║██╔══██║")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("██║ ╚═╝ ██║")}${c.cyan("╚██████╔╝██║  ██║")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.blue("╚═╝     ╚═╝")}${c.cyan(" ╚═════╝ ╚═╝  ╚═╝")}  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}`);
 
-  // ── Right panel: Recent activity ──
+  console.log(`  ${c.bold("Welcome back!")}`);
+  console.log("");
+  console.log(`  ${c.dim("FLOW CODE")}`);
+  console.log("");
+  console.log(`  ${c.dim(`${provider.name} | ${model}`)}`);
+  console.log(`  ${c.dim(cwd)}`);
+
   if (activity.length > 0) {
-    // Shift the right panel to align
-    console.log(`  ${c.dim("│")}  ${c.dim(`${provider.name} • ${model}`)}`);
-    console.log(`  ${c.dim("│")}  ${c.dim(cwd)}`);
-    console.log(`  ${c.dim("│")}`);
-    console.log(`  ${c.dim("│")}  ${c.bold(c.yellow("Recent activity"))}`);
+    console.log("");
+    console.log(`  ${c.bold(c.yellow("Recent activity"))}`);
     for (const entry of activity) {
       const ago = timeAgo(entry.time);
       const action = entry.action.length > 40 ? entry.action.slice(0, 37) + "..." : entry.action;
-      console.log(`  ${c.dim("│")}  ${c.dim(ago.padEnd(10))} ${action}`);
+      console.log(`  ${c.dim(ago.padEnd(10))} ${action}`);
     }
-  } else {
-    console.log(`  ${c.dim("│")}  ${c.dim(`${provider.name} • ${model}`)}`);
-    console.log(`  ${c.dim("│")}  ${c.dim(cwd)}`);
-    console.log(`  ${c.dim("│")}`);
-    console.log(`  ${c.dim("│")}  ${c.dim("No recent activity yet.")}`);
   }
 
-  console.log(`  ${c.dim("│")}`);
-  console.log(`  ${c.dim("│")}  ${c.dim("What's new:")}`);
-  console.log(`  ${c.dim("│")}  ${c.dim("/search")} to search the web`);
-  console.log(`  ${c.dim("│")}  ${c.dim("/resume")} to continue last conversation`);
-  console.log(`  ${c.dim("│")}  ${c.dim("/cmds")} to see all commands`);
-  console.log(`  ${c.dim("│")}  ${c.dim("/settings")} to configure preferences`);
-  console.log(`  ${c.dim("│")}  ${c.dim("Ctrl+C to exit")}`);
-  console.log(`  ${c.dim("└")}${hline}`);
+  console.log("");
+  console.log(`  ${c.bold(c.yellow("What's new"))}`);
+  console.log(`  ${c.dim("/search")} to search the web`);
+  console.log(`  ${c.dim("/resume")} to continue last conversation`);
+  console.log(`  ${c.dim("/cmds")} to see all commands`);
+  console.log(`  ${c.dim("/settings")} to configure preferences`);
+  console.log(`  ${c.dim("Ctrl+C to exit")}`);
+  console.log(hline);
   console.log("");
 }
 
@@ -909,14 +896,22 @@ async function streamResponse(
 // Main agent loop
 // ---------------------------------------------------------------------------
 
+interface SessionState {
+  client: OpenAI;
+  model: string;
+  intensity: Intensity;
+  provider: Provider;
+}
+
 async function run(
   client: OpenAI,
   model: string,
   intensity: Intensity,
   provider: Provider
 ): Promise<void> {
+  const state: SessionState = { client, model, intensity, provider };
   const history: Message[] = [
-    { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) },
+    { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) },
   ];
 
   while (true) {
@@ -958,7 +953,7 @@ async function run(
     // ── /clear ──
     if (input === "/clear") {
       history.length = 1;
-      history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+      history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
       console.log(c.green("  ✔ Conversation cleared.\n"));
       continue;
     }
@@ -978,7 +973,7 @@ async function run(
       // Restore cwd
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
-        history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+        history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
       }
       const msgCount = history.filter((m) => m.role === "user" || m.role === "assistant").length;
       console.log(c.green(`  ✔ Resumed ${msgCount} messages from ${formatSessionAge(session.timestamp)}.\n`));
@@ -1053,9 +1048,9 @@ async function run(
       console.log([
         "",
         c.bold("  Session:"),
-        `    Provider:   ${PROVIDERS[provider].name}`,
-        `    Model:      ${model}`,
-        `    Intensity:  ${intensity.toUpperCase()}`,
+        `    Provider:   ${PROVIDERS[state.provider].name}`,
+        `    Model:      ${state.model}`,
+        `    Intensity:  ${state.intensity.toUpperCase()}`,
         `    Messages:   ${history.length}`,
         `    Tokens:     ${totalUsed.toLocaleString()} / ${CONTEXT_WINDOW.toLocaleString()}`,
         renderUsageBar(totalUsed, CONTEXT_WINDOW),
@@ -1067,22 +1062,23 @@ async function run(
     // ── /models ──
     if (input === "/models") {
       try {
-        const res = await client.models.list();
+        const res = await state.client.models.list();
         const models = res.data
           .map((m) => m.id)
-          .filter((id) => PROVIDERS[provider].models.test(id))
+          .filter((id) => PROVIDERS[state.provider].models.test(id))
           .sort();
-        console.log(c.bold(`\n  ${PROVIDERS[provider].name} Models:`));
+        console.log(c.bold(`\n  ${PROVIDERS[state.provider].name} Models:`));
         models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
         const choice = await ask(`\n  Select (0-${models.length - 1}): `);
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
           const newModel = sanitizeModelId(models[idx]);
+          state.model = newModel;
           console.log(c.green(`  ✔ ${newModel}\n`));
           const config = loadConfig();
           config.defaultModel = newModel;
           saveConfig(config);
-          history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+          history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
         }
       } catch {
         console.log(c.red("  Could not fetch models."));
@@ -1098,17 +1094,49 @@ async function run(
       const pChoice = await ask("  Select (1-2): ");
       const newProvider: Provider = pChoice === "2" ? "cerebras" : "groq";
 
-      if (newProvider !== provider) {
-        console.log(c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`));
-        const key = await ask("  API Key: ");
-        if (key && key.length > 10) {
-          const config = loadConfig();
-          config.provider = newProvider;
-          config.apiKey = key;
-          config.defaultModel = PROVIDERS[newProvider].defaultModel;
-          saveConfig(config);
-          console.log(c.green(`  ✔ Switched to ${PROVIDERS[newProvider].name}. Restart to apply.\n`));
-        }
+      if (newProvider === state.provider) {
+        console.log(c.yellow(`  Already using ${PROVIDERS[state.provider].name}.\n`));
+        continue;
+      }
+
+      console.log(c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`));
+      const key = await ask("  API Key: ");
+      if (!key || key.length < 10) {
+        console.log(c.red("  Invalid key. Provider not changed.\n"));
+        continue;
+      }
+
+      // Create new client
+      const newClient = new OpenAI({
+        baseURL: PROVIDERS[newProvider].baseURL,
+        apiKey: key,
+      });
+
+      // Test connection
+      try {
+        console.log(c.dim(`  Connecting to ${PROVIDERS[newProvider].name}...`));
+        await newClient.models.list();
+
+        // Success — update state
+        state.client = newClient;
+        state.provider = newProvider;
+        state.model = PROVIDERS[newProvider].defaultModel;
+
+        // Save config
+        const config = loadConfig();
+        config.provider = newProvider;
+        config.apiKey = key;
+        config.defaultModel = state.model;
+        saveConfig(config);
+
+        // Update system prompt
+        history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
+
+        console.log(c.green(`  ✔ Switched to ${PROVIDERS[newProvider].name} | ${state.model}\n`));
+        logActivity(`Switched to ${PROVIDERS[newProvider].name}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "Connection failed";
+        console.error(c.red(`  ✘ ${PROVIDERS[newProvider].name}: ${msg}\n`));
       }
       continue;
     }
@@ -1271,7 +1299,7 @@ async function run(
           console.log(c.dim("  Directory:"));
           console.log(c.dim(tree) + "\n");
         }
-        history[0] = { role: "system", content: getSystemPrompt(intensity, newCwd, provider) };
+        history[0] = { role: "system", content: getSystemPrompt(state.intensity, newCwd, state.provider) };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(c.red(`  ✘ ${msg}`));
@@ -1280,7 +1308,7 @@ async function run(
     }
 
     // ── Update system prompt ──
-    history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+    history[0] = { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) };
 
     // ── Auto-search: if the input likely needs external data ──
     let finalInput = input;
@@ -1303,12 +1331,12 @@ async function run(
     const trimmed = trimHistory(history);
 
     // Temperature
-    const temp = intensity === "low" ? 0.0 : intensity === "medium" ? 0.2 : 0.4;
+    const temp = state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.2 : 0.4;
 
     // Stream response
     try {
       process.stdout.write(c.dim("  ⏳ Thinking...\r"));
-      const { content: reply, usage } = await streamResponse(client, model, trimmed, temp);
+      const { content: reply, usage } = await streamResponse(state.client, state.model, trimmed, temp);
 
       if (!reply) {
         console.log(c.red("  No response."));
@@ -1342,13 +1370,13 @@ async function run(
       }
 
       // Auto-save session for /resume
-      saveSession(history, model, provider, intensity);
+      saveSession(history, state.model, state.provider, state.intensity);
     } catch (err: unknown) {
       process.stdout.write(" ".repeat(30) + "\r");
       const msg = err instanceof Error ? err.message : String(err);
 
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
-        console.error(c.red(`  ✘ Invalid API key for ${PROVIDERS[provider].name}. Delete ~/.flow-code-config and restart.`));
+        console.error(c.red(`  ✘ Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`));
       } else if (msg.includes("429")) {
         console.error(c.yellow("  ⚠ Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
