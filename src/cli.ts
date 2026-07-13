@@ -1389,7 +1389,22 @@ function main(): void {
   printBanner();
 
   setup()
-    .then(({ client, model, intensity, provider }) => {
+    .then(async ({ client, model, intensity, provider }) => {
+      // Ask for working directory
+      console.log(c.dim(`  Current directory: ${process.cwd()}`));
+      const dirInput = await ask(c.bold("  Project directory (Enter to keep current): "));
+      if (dirInput.trim()) {
+        const target = path.resolve(dirInput.trim());
+        try {
+          process.chdir(target);
+          console.log(c.green(`  ✔ ${process.cwd()}\n`));
+        } catch {
+          console.log(c.yellow(`  ⚠ Could not open '${target}'. Using current.\n`));
+        }
+      } else {
+        console.log("");
+      }
+
       const config = loadConfig();
       printDashboard(config);
 
