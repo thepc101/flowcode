@@ -26,9 +26,11 @@ const YELLOW = "\x1b[33m";
 const MAGENTA = "\x1b[35m";
 
 type Intensity = "low" | "medium" | "high";
+type Provider = "groq" | "cerebras";
 
 interface Config {
   apiKey: string;
+  provider: Provider;
   defaultModel?: string;
   intensity?: Intensity;
 }
@@ -39,12 +41,38 @@ interface UsageInfo {
   totalTokens: number;
 }
 
+interface SearchResult {
+  title: string;
+  snippet: string;
+  url: string;
+}
+
+// ---------------------------------------------------------------------------
+// Provider configuration
+// ---------------------------------------------------------------------------
+
+const PROVIDERS: Record<Provider, { name: string; baseURL: string; defaultModel: string; models: RegExp }> = {
+  groq: {
+    name: "Groq",
+    baseURL: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    models: /llama|mixtral|qwen|gemma|deepseek/i,
+  },
+  cerebras: {
+    name: "Cerebras",
+    baseURL: "https://api.cerebras.ai/v1",
+    defaultModel: "llama-3.3-70b",
+    models: /llama|qwen/i,
+  },
+};
+
 // ---------------------------------------------------------------------------
 // ANSI helpers
 // ---------------------------------------------------------------------------
 
 const c = {
   blue: (t: string) => `${CYAN}${t}${RESET}`,
+  cyan: (t: string) => `${CYAN}${t}${RESET}`,
   green: (t: string) => `${GREEN}${t}${RESET}`,
   red: (t: string) => `${RED}${t}${RESET}`,
   dim: (t: string) => `${DIM}${t}${RESET}`,
@@ -69,15 +97,8 @@ function renderUsageBar(used: number, total: number): string {
   const pct = Math.min(used / total, 1);
   const filled = Math.round(pct * 20);
   const empty = 20 - filled;
-  const bar =
-    GREEN +
-    "█".repeat(filled) +
-    RESET +
-    DIM +
-    "░".repeat(empty) +
-    RESET;
+  const bar = GREEN + "█".repeat(filled) + RESET + DIM + "░".repeat(empty) + RESET;
   const pctStr = Math.round(pct * 100) + "%";
-
   return `  ${c.dim("Context:")} ${bar} ${c.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
 }
 
@@ -101,7 +122,152 @@ function printUsage(usage: UsageInfo, history: Message[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// Banner
+// Web search — DuckDuckGo, no API key needed
+// ---------------------------------------------------------------------------
+
+async function searchWeb(query: string, numResults: number = 5): Promise<SearchResult[]> {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const html = await res.text();
+    const results: SearchResult[] = [];
+
+    // Extract result blocks
+    const resultRegex = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = resultRegex.exec(html)) !== null && results.length < numResults) {
+      const rawUrl = match[1];
+      const title = match[2].replace(/<[^>]*>/g, "").trim();
+      const snippet = match[3].replace(/<[^>]*>/g, "").trim();
+
+      // DuckDuckGo wraps URLs in a redirect — extract the actual URL
+      const urlMatch = rawUrl.match(/uddg=([^&]+)/);
+      const finalUrl = urlMatch ? decodeURIComponent(urlMatch[1]) : rawUrl;
+
+      if (title && snippet) {
+        results.push({ title, snippet, url: finalUrl });
+      }
+    }
+
+    return results;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Search failed";
+    console.error(c.red(`  Search error: ${msg}`));
+    return [];
+  }
+}
+
+function formatSearchResults(results: SearchResult[], query: string): string {
+  if (results.length === 0) {
+    return `No results found for "${query}".`;
+  }
+
+  const lines: string[] = [
+    "",
+    `  ${c.bold(c.blue("Search Results"))} ${c.dim(`for "${query}"`)}`,
+    "",
+  ];
+
+  results.forEach((r, i) => {
+    lines.push(`  ${c.bold(c.green(`${i + 1}.`))} ${c.bold(r.title)}`);
+    lines.push(`     ${c.dim(r.snippet)}`);
+    lines.push(`     ${c.dim(r.url)}`);
+    lines.push("");
+  });
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Fetch URL content
+// ---------------------------------------------------------------------------
+
+async function fetchUrlContent(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept: "text/html,application/xhtml+xml",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    const html = await res.text();
+
+    // Strip HTML tags and collapse whitespace
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#\d+;/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Return first 12000 chars
+    return text.slice(0, 12000);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Fetch failed";
+    return `Failed to fetch URL: ${msg}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recent activity log
+// ---------------------------------------------------------------------------
+
+const ACTIVITY_PATH = path.join(os.homedir(), ".flow-code-activity");
+
+interface ActivityEntry {
+  time: number;
+  action: string;
+}
+
+function logActivity(action: string): void {
+  try {
+    let entries: ActivityEntry[] = [];
+    if (fs.existsSync(ACTIVITY_PATH)) {
+      entries = JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8"));
+    }
+    entries.unshift({ time: Date.now(), action });
+    entries = entries.slice(0, 20); // keep last 20
+    fs.writeFileSync(ACTIVITY_PATH, JSON.stringify(entries, null, 2), { encoding: "utf-8", mode: 0o600 });
+  } catch { /* ignore */ }
+}
+
+function getRecentActivity(): ActivityEntry[] {
+  try {
+    if (fs.existsSync(ACTIVITY_PATH)) {
+      return JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8")).slice(0, 5);
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+function timeAgo(ts: number): string {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return `${Math.floor(days / 7)}w ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Banner + Dashboard
 // ---------------------------------------------------------------------------
 
 function printBanner(): void {
@@ -113,6 +279,60 @@ function printBanner(): void {
   console.log(c.blue("  │                                        │"));
   console.log(c.blue("  └────────────────────────────────────────┘"));
   console.log(c.dim("        [FREE & OPEN SOURCE]"));
+  console.log("");
+}
+
+function printDashboard(config: Config): void {
+  console.clear();
+  const provider = PROVIDERS[config.provider || "groq"];
+  const model = config.defaultModel || provider.defaultModel;
+  const cwd = process.cwd();
+  const activity = getRecentActivity();
+
+  const w = 78;
+  const hline = c.dim("─".repeat(w));
+
+  console.log("");
+  console.log(`  ${c.dim("───")} ${c.bold(c.blue("Flow Code"))} ${c.dim("v1.0.0")} ${c.dim("─".repeat(w - 28))}`);
+
+  // ── Left panel: Welcome + icon ──
+  console.log("");
+  console.log(`  ${c.dim("┌")} ${c.bold("Welcome back!")}`);
+  console.log(`  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("███╗   ███╗")}${c.cyan("██╗   ██╗██╗  ██╗")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("████╗ ████║")}${c.cyan("██║   ██║██║  ██║")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("██╔████╔██║")}${c.cyan("██║   ██║███████║")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("██║╚██╔╝██║")}${c.cyan("██║   ██║██╔══██║")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("██║ ╚═╝ ██║")}${c.cyan("╚██████╔╝██║  ██║")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.blue("╚═╝     ╚═╝")}${c.cyan(" ╚═════╝ ╚═╝  ╚═╝")}  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}`);
+
+  // ── Right panel: Recent activity ──
+  if (activity.length > 0) {
+    // Shift the right panel to align
+    console.log(`  ${c.dim("│")}  ${c.dim(`${provider.name} • ${model}`)}`);
+    console.log(`  ${c.dim("│")}  ${c.dim(cwd)}`);
+    console.log(`  ${c.dim("│")}`);
+    console.log(`  ${c.dim("│")}  ${c.bold(c.yellow("Recent activity"))}`);
+    for (const entry of activity) {
+      const ago = timeAgo(entry.time);
+      const action = entry.action.length > 40 ? entry.action.slice(0, 37) + "..." : entry.action;
+      console.log(`  ${c.dim("│")}  ${c.dim(ago.padEnd(10))} ${action}`);
+    }
+  } else {
+    console.log(`  ${c.dim("│")}  ${c.dim(`${provider.name} • ${model}`)}`);
+    console.log(`  ${c.dim("│")}  ${c.dim(cwd)}`);
+    console.log(`  ${c.dim("│")}`);
+    console.log(`  ${c.dim("│")}  ${c.dim("No recent activity yet.")}`);
+  }
+
+  console.log(`  ${c.dim("│")}`);
+  console.log(`  ${c.dim("│")}  ${c.dim("What's new:")}`);
+  console.log(`  ${c.dim("│")}  ${c.dim("/search")} to search the web`);
+  console.log(`  ${c.dim("│")}  ${c.dim("/settings")} to configure preferences`);
+  console.log(`  ${c.dim("│")}  ${c.dim("/provider")} to switch Groq / Cerebras`);
+  console.log(`  ${c.dim("│")}  ${c.dim("Ctrl+C to exit")}`);
+  console.log(`  ${c.dim("└")}${hline}`);
   console.log("");
 }
 
@@ -151,7 +371,7 @@ async function askMultiline(): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Shell execution — no shell injection
+// Shell execution
 // ---------------------------------------------------------------------------
 
 function execShellStreaming(
@@ -210,144 +430,62 @@ function execShellStreaming(
 // ---------------------------------------------------------------------------
 
 const IGNORE_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  ".next",
-  ".cache",
-  "__pycache__",
-  ".vscode",
-  ".idea",
-  "coverage",
-  ".turbo",
-  ".vercel",
-  ".netlify",
-  "target",
-  "vendor",
-  ".tox",
-  "venv",
-  ".venv",
+  "node_modules", ".git", "dist", "build", ".next", ".cache",
+  "__pycache__", ".vscode", ".idea", "coverage", ".turbo",
+  ".vercel", ".netlify", "target", "vendor", ".tox", "venv", ".venv",
 ]);
 
 const IGNORE_FILES = new Set([
-  ".DS_Store",
-  "Thumbs.db",
-  ".env",
-  ".env.local",
-  ".env.development",
-  ".env.production",
-  "package-lock.json",
-  "yarn.lock",
-  "pnpm-lock.yaml",
+  ".DS_Store", "Thumbs.db", ".env", ".env.local",
+  ".env.development", ".env.production",
+  "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 ]);
 
-function scanDirectory(
-  dir: string,
-  depth: number = 3,
-  prefix: string = ""
-): string {
+function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): string {
   const lines: string[] = [];
   if (depth < 0) return "";
 
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
-
     const dirs = entries
-      .filter(
-        (e) =>
-          e.isDirectory() &&
-          !IGNORE_DIRS.has(e.name) &&
-          !e.name.startsWith(".")
-      )
+      .filter((e) => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith("."))
       .sort((a, b) => a.name.localeCompare(b.name));
-
     const files = entries
-      .filter(
-        (e) =>
-          e.isFile() &&
-          !IGNORE_FILES.has(e.name) &&
-          !e.name.startsWith(".")
-      )
+      .filter((e) => e.isFile() && !IGNORE_FILES.has(e.name) && !e.name.startsWith("."))
       .sort((a, b) => a.name.localeCompare(b.name));
 
-    const all = [...dirs, ...files];
-
-    all.forEach((entry, i) => {
-      const isLast = i === all.length - 1;
+    [...dirs, ...files].forEach((entry, i) => {
+      const isLast = i === [...dirs, ...files].length - 1;
       const connector = isLast ? "└── " : "├── ";
       const childPrefix = isLast ? "    " : "│   ";
 
       if (entry.isDirectory()) {
         lines.push(`${prefix}${connector}${entry.name}/`);
-        const sub = scanDirectory(
-          path.join(dir, entry.name),
-          depth - 1,
-          prefix + childPrefix
-        );
+        const sub = scanDirectory(path.join(dir, entry.name), depth - 1, prefix + childPrefix);
         if (sub) lines.push(sub);
       } else {
         lines.push(`${prefix}${connector}${entry.name}`);
       }
     });
-  } catch {
-    // permission denied or path does not exist
-  }
+  } catch { /* permission denied */ }
 
   return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Code block rendering with boxes
+// Code block rendering
 // ---------------------------------------------------------------------------
 
 const LANG_LABELS: Record<string, string> = {
-  html: "HTML",
-  css: "CSS",
-  js: "JavaScript",
-  javascript: "JavaScript",
-  ts: "TypeScript",
-  typescript: "TypeScript",
-  py: "Python",
-  python: "Python",
-  json: "JSON",
-  yaml: "YAML",
-  yml: "YAML",
-  md: "Markdown",
-  bash: "Bash",
-  sh: "Shell",
-  shell: "Shell",
-  jsx: "JSX",
-  tsx: "TSX",
-  sql: "SQL",
-  rust: "Rust",
-  go: "Go",
-  java: "Java",
-  c: "C",
-  cpp: "C++",
-  rb: "Ruby",
-  php: "PHP",
-  swift: "Swift",
-  kt: "Kotlin",
-  toml: "TOML",
-  xml: "XML",
-  svg: "SVG",
-  dockerfile: "Dockerfile",
-  makefile: "Makefile",
-  prisma: "Prisma",
-  graphql: "GraphQL",
-  graphqls: "GraphQL Schema",
-  env: "Env",
-  gitignore: "Gitignore",
-  lua: "Lua",
-  r: "R",
-  dart: "Dart",
-  scala: "Scala",
-  ex: "Elixir",
-  exs: "Elixir",
-  erl: "Erlang",
-  hs: "Haskell",
-  clj: "Clojure",
+  html: "HTML", css: "CSS", js: "JavaScript", javascript: "JavaScript",
+  ts: "TypeScript", typescript: "TypeScript", py: "Python", python: "Python",
+  json: "JSON", yaml: "YAML", yml: "YAML", md: "Markdown",
+  bash: "Bash", sh: "Shell", shell: "Shell", jsx: "JSX", tsx: "TSX",
+  sql: "SQL", rust: "Rust", go: "Go", java: "Java", c: "C", cpp: "C++",
+  rb: "Ruby", php: "PHP", swift: "Swift", kt: "Kotlin", toml: "TOML",
+  xml: "XML", svg: "SVG", dockerfile: "Dockerfile", makefile: "Makefile",
+  prisma: "Prisma", graphql: "GraphQL", lua: "Lua", r: "R", dart: "Dart",
+  scala: "Scala", ex: "Elixir", exs: "Elixir", hs: "Haskell", clj: "Clojure",
 };
 
 function renderCodeBox(lang: string, code: string): string {
@@ -355,16 +493,12 @@ function renderCodeBox(lang: string, code: string): string {
   const lines = code.split("\n");
   const maxLen = Math.max(label.length + 4, ...lines.map((l) => l.length));
   const width = Math.min(maxLen + 2, 120);
-
   const top = `${DIM}┌─ ${label} ${"─".repeat(Math.max(0, width - label.length - 3))}┐${RESET}`;
   const bottom = `${DIM}└${"─".repeat(width)}┘${RESET}`;
-
   const body = lines.map((line) => {
-    const truncated =
-      line.length > width ? line.slice(0, width - 3) + "..." : line;
+    const truncated = line.length > width ? line.slice(0, width - 3) + "..." : line;
     return `${DIM}│${RESET} ${truncated}`;
   });
-
   return [top, ...body, bottom].join("\n");
 }
 
@@ -376,10 +510,10 @@ function formatResponse(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt — elite level
+// System prompt
 // ---------------------------------------------------------------------------
 
-function getSystemPrompt(intensity: Intensity, cwd: string): string {
+function getSystemPrompt(intensity: Intensity, cwd: string, provider: Provider): string {
   const descriptions: Record<Intensity, string> = {
     low: "Be transactional. Execute the exact task. Optimize for speed.",
     medium: "Analyze impacted files. Verify changes compile. Standard depth.",
@@ -387,106 +521,75 @@ function getSystemPrompt(intensity: Intensity, cwd: string): string {
   };
 
   const dirTree = scanDirectory(cwd, 3);
+  const providerName = PROVIDERS[provider].name;
 
   return [
-    "You are FLOW CODE — the world's best open-source terminal coding agent.",
-    "You write code at the level of a principal engineer at a FAANG company.",
+    `You are FLOW CODE — powered by ${providerName}. You write code at the level of a principal engineer.`,
     "Every response must be production-ready, complete, and immediately runnable.",
     "",
-    `Current Working Directory: ${cwd}`,
-    `Processing Intensity: ${intensity.toUpperCase()} — ${descriptions[intensity]}`,
-    `Context Window: ${CONTEXT_WINDOW.toLocaleString()} tokens`,
+    `Provider: ${providerName}`,
+    `Working Directory: ${cwd}`,
+    `Intensity: ${intensity.toUpperCase()} — ${descriptions[intensity]}`,
     "",
-    "Directory Contents:",
+    "Directory:",
     dirTree || "(empty)",
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "  CODING STANDARDS — FOLLOW EVERY RULE",
+    "  WEB SEARCH INTEGRATION",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "",
-    "GENERAL RULES:",
-    "- ALWAYS read existing files before modifying. Never guess file contents.",
-    "- Match the existing code style exactly — indentation, naming, patterns.",
-    "- Use TypeScript strict mode. No `any` types. Proper interfaces and types.",
-    "- Prefer `const` over `let`. Never use `var`.",
-    "- Use early returns to flatten nesting.",
-    "- Handle every error explicitly. Never swallow errors silently.",
-    "- Write self-documenting code. Descriptive variable and function names.",
-    "- No magic numbers. Use named constants.",
-    "- No console.log debugging in production code.",
+    "When the user asks a question requiring up-to-date information:",
+    "- Search first using the /search command.",
+    "- Use the results to inform your response.",
+    "- For library/framework questions, search for the latest docs.",
+    "- Always cite sources when using web search results.",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "  CODING STANDARDS",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "GENERAL:",
+    "- Read existing files before modifying. Never guess file contents.",
+    "- Match existing code style exactly.",
+    "- TypeScript strict mode. No `any`. Proper interfaces.",
+    "- `const` over `let`. Never `var`.",
+    "- Early returns. Explicit error handling.",
+    "- Self-documenting names. No magic numbers.",
     "",
     "TYPESCRIPT / JAVASCRIPT:",
-    "- `interface` for object shapes. `type` for unions/intersections/enums.",
-    "- `async/await` everywhere. No raw `.then()` chains.",
+    "- `interface` for objects, `type` for unions.",
+    "- `async/await` everywhere.",
     "- Optional chaining `?.` and nullish coalescing `??`.",
-    "- Destructure objects and arrays in function parameters.",
-    "- Export types alongside implementations.",
-    "- Use `Record<K,V>` for typed objects. Use `Partial<T>`, `Pick<T>`, `Omit<T>`.",
-    "- Prefer `Array.map/filter/reduce` over imperative loops.",
-    "- Always handle `null` and `undefined` explicitly.",
+    "- Destructure params. Export types.",
+    "- `Record<K,V>`, `Partial<T>`, `Pick<T>`, `Omit<T>`.",
     "",
-    "REACT / JSX / TSX:",
-    "- Functional components only. No class components.",
-    "- TypeScript interfaces for all props: `interface Props { ... }`.",
-    "- Hooks: `useState`, `useEffect`, `useMemo`, `useCallback`, `useRef`, `useContext`.",
-    "- Single responsibility. One component = one job.",
-    "- Tailwind CSS utility classes preferred.",
-    "- Memoize expensive computations with `useMemo`.",
-    "- Avoid inline functions in JSX — extract to handlers.",
-    "",
-    "NEXT.JS:",
-    "- App Router with server components by default.",
-    "- Server Actions for mutations.",
-    "- `fetch` with revalidation, not client-side data fetching.",
-    "- Metadata API for SEO.",
+    "REACT / NEXT.JS:",
+    "- Functional components. TypeScript props interfaces.",
+    "- Hooks: useState, useEffect, useMemo, useCallback.",
+    "- Next.js App Router. Server components. Server Actions.",
+    "- Tailwind CSS utilities.",
     "",
     "HTML / CSS:",
-    "- Semantic HTML5: `<main>`, `<section>`, `<article>`, `<nav>`, `<header>`, `<footer>`.",
-    "- CSS custom properties for theming.",
-    "- Flexbox and Grid only. No floats.",
-    "- Mobile-first responsive design.",
+    "- Semantic HTML5. CSS custom properties.",
+    "- Flexbox/Grid. Mobile-first responsive.",
     "- ARIA labels for accessibility.",
     "",
     "PYTHON:",
-    "- Type hints on ALL function signatures.",
-    "- PEP 8 naming: `snake_case` functions, `PascalCase` classes.",
-    "- f-strings for interpolation.",
-    "- `pathlib.Path` over `os.path`.",
-    "- `dataclasses` or `pydantic` for data models.",
+    "- Type hints on all functions. PEP 8 naming.",
+    "- f-strings. pathlib.Path. dataclasses/pydantic.",
     "",
-    "BASH / SHELL:",
-    "- `#!/usr/bin/env bash` shebang.",
-    "- `set -euo pipefail` at the top.",
-    "- Quote all variables: `\"$variable\"`.",
-    "- Use `--yes` / `-y` for non-interactive installs.",
+    "BASH:",
+    "- `#!/usr/bin/env bash`. `set -euo pipefail`.",
+    "- Quote variables. Use --yes flags.",
     "",
-    "DATABASE / SQL:",
-    "- Parameterized queries. Never interpolate user input.",
-    "- Index frequently queried columns.",
-    "- Transactions for multi-step mutations.",
+    "FILE OPS:",
+    "- mkdir -p for directories. Complete files only.",
+    "- Edit existing files over creating new ones.",
     "",
-    "FILE OPERATIONS:",
-    "- Ensure parent directories exist with `mkdir -p`.",
-    "- Write COMPLETE files, never partial.",
-    "- Prefer editing existing files over creating new ones.",
-    "",
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "  RESPONSE FORMAT",
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "- Be concise. Explain only when the task is complex.",
-    "- Use fenced code blocks with language tags.",
-    "- For multi-file projects: each file in its own block.",
-    "- After code, show exact bash commands to run.",
-    "",
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "  EXECUTION RULES",
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "- Wrap bash commands in ```bash code blocks.",
-    "- Always use --yes / -y flags for non-interactive operations.",
-    "- Verify code compiles/runs before marking complete.",
-    "- On error, analyze output and fix — do not just report the error.",
+    "RESPONSE FORMAT:",
+    "- Concise. Fenced code blocks with language tags.",
+    "- Show bash commands after code.",
+    "- On error, analyze and fix — don't just report.",
   ].join("\n");
 }
 
@@ -499,21 +602,18 @@ function loadConfig(): Config {
     if (fs.existsSync(CONFIG_PATH)) {
       const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
       const parsed = JSON.parse(raw);
-      // Validate structure
       if (typeof parsed.apiKey === "string" && parsed.apiKey.length > 0) {
         return parsed as Config;
       }
     }
-  } catch {
-    // corrupted or invalid — start fresh
-  }
-  return { apiKey: "" };
+  } catch { /* start fresh */ }
+  return { apiKey: "", provider: "groq" };
 }
 
 function saveConfig(config: Config): void {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), {
     encoding: "utf-8",
-    mode: 0o600, // owner read/write only
+    mode: 0o600,
   });
 }
 
@@ -525,43 +625,57 @@ async function setup(): Promise<{
   client: OpenAI;
   model: string;
   intensity: Intensity;
+  provider: Provider;
 }> {
   const config = loadConfig();
 
+  // Provider selection
+  let provider: Provider = config.provider || "groq";
+  if (!config.apiKey) {
+    console.log(c.bold("  Select AI Provider:"));
+    console.log(`    ${c.dim("[1]")} Groq    — Ultra-fast inference, open-source models`);
+    console.log(`    ${c.dim("[2]")} Cerebras — Wafer-scale AI, blazing speed`);
+    const pChoice = await ask("  Select (1-2): ");
+    provider = pChoice === "2" ? "cerebras" : "groq";
+  }
+
+  const providerConfig = PROVIDERS[provider];
+
   // API key
   if (!config.apiKey) {
-    console.log(c.dim("  No API key found. Let's set one up."));
-    const key = await ask("  Enter your Groq API Key: ");
+    console.log(c.dim(`\n  Enter your ${providerConfig.name} API Key:`));
+    const key = await ask("  API Key: ");
     if (!key || key.length < 10) {
       console.error(c.red("  Invalid key. Exiting."));
       process.exit(1);
     }
     config.apiKey = key;
+    config.provider = provider;
     saveConfig(config);
+  } else {
+    provider = config.provider;
   }
 
   const client = new OpenAI({
-    baseURL: "https://api.groq.com/openai/v1",
+    baseURL: PROVIDERS[provider].baseURL,
     apiKey: config.apiKey,
   });
 
   // Model selection
-  let model = sanitizeModelId(config.defaultModel || "llama-3.3-70b-versatile");
+  let model = sanitizeModelId(config.defaultModel || PROVIDERS[provider].defaultModel);
 
   try {
-    console.log(c.dim("  Fetching available models..."));
+    console.log(c.dim(`  Fetching ${PROVIDERS[provider].name} models...`));
     const res = await client.models.list();
     const models = res.data
       .map((m) => m.id)
-      .filter((id) => /llama|mixtral|qwen|gemma|deepseek/i.test(id))
+      .filter((id) => PROVIDERS[provider].models.test(id))
       .sort();
 
     if (models.length > 0) {
       console.log(c.bold("\n  Available Models:"));
       models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
-      const choice = await ask(
-        `\n  Select model (0-${models.length - 1}, Enter for default): `
-      );
+      const choice = await ask(`\n  Select model (0-${models.length - 1}, Enter for default): `);
       if (choice !== "") {
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
@@ -579,33 +693,22 @@ async function setup(): Promise<{
   console.log(`    ${c.dim("[2]")} Medium — Standard refactoring`);
   console.log(`    ${c.dim("[3]")} High   — Deep scanning & DevOps`);
 
-  const intensityMap: Record<string, Intensity> = {
-    "1": "low",
-    "2": "medium",
-    "3": "high",
-  };
+  const intensityMap: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
   let intensity: Intensity = config.intensity || "medium";
   const choice = await ask("  Select mode (1-3): ");
-  if (intensityMap[choice]) {
-    intensity = intensityMap[choice];
-  }
+  if (intensityMap[choice]) intensity = intensityMap[choice];
 
   config.defaultModel = model;
   config.intensity = intensity;
+  config.provider = provider;
   saveConfig(config);
 
   console.log("");
-  console.log(
-    c.green(`  ✔ Ready — Model: ${model} | Mode: ${intensity.toUpperCase()}`)
-  );
-  console.log(c.dim(`  Context: ${CONTEXT_WINDOW.toLocaleString()} tokens available`));
-  console.log(
-    c.dim(
-      "  Commands: exit, cd <path>, /clear, /compact, /help, /models\n"
-    )
-  );
+  console.log(c.green(`  ✔ ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`));
+  console.log(c.dim(`  Context: ${CONTEXT_WINDOW.toLocaleString()} tokens`));
+  console.log(c.dim("  Commands: exit, cd, /clear, /compact, /help, /models, /search, /fetch\n"));
 
-  return { client, model, intensity };
+  return { client, model, intensity, provider };
 }
 
 // ---------------------------------------------------------------------------
@@ -618,13 +721,11 @@ function trimHistory(history: Message[]): Message[] {
   let total = 0;
   const result: Message[] = [];
 
-  // Always keep system prompt first
   if (history.length > 0 && history[0].role === "system") {
     result.push(history[0]);
     total += estimateTokens(history[0].content as string);
   }
 
-  // Walk backwards, keep most recent messages that fit
   for (let i = history.length - 1; i >= 1; i--) {
     const msg = history[i];
     const content =
@@ -650,19 +751,52 @@ function extractBashBlocks(text: string): string[] {
   const blocks: string[] = [];
   const regex = /```bash\n([\s\S]*?)```/g;
   let match: RegExpExecArray | null;
-
   while ((match = regex.exec(text)) !== null) {
     const block = match[1].trim();
-    if (block.length > 0 && block.length < 10000) {
-      blocks.push(block);
-    }
+    if (block.length > 0 && block.length < 10000) blocks.push(block);
   }
-
   return blocks;
 }
 
 // ---------------------------------------------------------------------------
-// Streaming API call
+// Auto-search detection
+// ---------------------------------------------------------------------------
+
+const SEARCH_TRIGGERS = [
+  /\blatest\b/i,
+  /\bcurrent(ly)?\b/i,
+  /\brecent(ly)?\b/i,
+  /\bwhat('s| is) the (best|new|latest|current)\b/i,
+  /\bhow (do|to|does)\b/i,
+  /\bwh?at (is|are|was|were)\b.*\b(version|release|update)\b/i,
+  /\btoday\b/i,
+  /\bthis (year|month|week)\b/i,
+  /\b20\d{2}\b/,
+  /\bvs\.?\b/i,
+  /\bcompared? to\b/i,
+  /\bnewest\b/i,
+  /\bavailable\b/i,
+  /\bsupport(ed|s|ing)?\b.*\bfor\b/i,
+  /\bwhich .*(is best|should i|recommend)\b/i,
+  /\bweather\b/i,
+  /\bnews\b/i,
+  /\bstock(s)?\b/i,
+  /\bprice\b/i,
+  /\brelease(d)?\b/i,
+];
+
+function needsWebSearch(input: string): boolean {
+  // Skip if it's clearly a code-only task
+  if (/^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update)\s/i.test(input)) {
+    return false;
+  }
+  // Skip short inputs
+  if (input.length < 15) return false;
+  return SEARCH_TRIGGERS.some((re) => re.test(input));
+}
+
+// ---------------------------------------------------------------------------
+// Streaming API
 // ---------------------------------------------------------------------------
 
 async function streamResponse(
@@ -686,7 +820,6 @@ async function streamResponse(
   let started = false;
 
   for await (const chunk of stream) {
-    // Token usage (final chunk)
     if (chunk.usage) {
       usage = {
         promptTokens: chunk.usage.prompt_tokens,
@@ -694,7 +827,6 @@ async function streamResponse(
         totalTokens: chunk.usage.total_tokens,
       };
     }
-
     const delta = chunk.choices[0]?.delta?.content;
     if (delta) {
       if (!started) {
@@ -717,10 +849,11 @@ async function streamResponse(
 async function run(
   client: OpenAI,
   model: string,
-  intensity: Intensity
+  intensity: Intensity,
+  provider: Provider
 ): Promise<void> {
   const history: Message[] = [
-    { role: "system", content: getSystemPrompt(intensity, process.cwd()) },
+    { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) },
   ];
 
   while (true) {
@@ -736,31 +869,31 @@ async function run(
 
     // ── /help ──
     if (input === "/help") {
-      console.log(
-        [
-          "",
-          c.bold("  Commands:"),
-          `    ${c.dim("cd <path>")}       Switch working directory`,
-          `    ${c.dim("/clear")}           Reset conversation history`,
-          `    ${c.dim("/compact")}         Trim history to fit context`,
-          `    ${c.dim("/models")}          Re-select model`,
-          `    ${c.dim("/status")}          Show context usage`,
-          `    ${c.dim("exit")}             Quit Flow Code`,
-          "",
-          c.dim("  Multiline: end a line with \\ to continue."),
-          "",
-        ].join("\n")
-      );
+      console.log([
+        "",
+        c.bold("  Commands:"),
+        `    ${c.dim("cd <path>")}        Switch directory`,
+        `    ${c.dim("/search <query>")}  Search the web`,
+        `    ${c.dim("/fetch <url>")}     Fetch URL content`,
+        `    ${c.dim("/settings")}        Configure preferences`,
+        `    ${c.dim("/clear")}           Reset conversation`,
+        `    ${c.dim("/compact")}         Trim context`,
+        `    ${c.dim("/models")}          Re-select model`,
+        `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
+        `    ${c.dim("/status")}          Show usage stats`,
+        `    ${c.dim("exit")}             Quit`,
+        "",
+        c.dim("  Auto-search: when a question needs current data,"),
+        c.dim("  the agent searches the web automatically."),
+        "",
+      ].join("\n"));
       continue;
     }
 
     // ── /clear ──
     if (input === "/clear") {
       history.length = 1;
-      history[0] = {
-        role: "system",
-        content: getSystemPrompt(intensity, process.cwd()),
-      };
+      history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
       console.log(c.green("  ✔ Conversation cleared.\n"));
       continue;
     }
@@ -771,9 +904,7 @@ async function run(
       const compacted = trimHistory(history);
       history.length = 0;
       history.push(...compacted);
-      console.log(
-        c.green(`  ✔ Compacted: ${before} → ${history.length} messages.\n`)
-      );
+      console.log(c.green(`  ✔ Compacted: ${before} → ${history.length} messages.\n`));
       continue;
     }
 
@@ -788,14 +919,17 @@ async function run(
               : "";
         return acc + estimateTokens(content);
       }, 0);
-      console.log("");
-      console.log(`  ${c.bold("Session Status:")}`);
-      console.log(`    Model:       ${model}`);
-      console.log(`    Intensity:   ${intensity.toUpperCase()}`);
-      console.log(`    Messages:    ${history.length}`);
-      console.log(`    Est. tokens: ${totalUsed.toLocaleString()} / ${CONTEXT_WINDOW.toLocaleString()}`);
-      console.log(renderUsageBar(totalUsed, CONTEXT_WINDOW));
-      console.log("");
+      console.log([
+        "",
+        c.bold("  Session:"),
+        `    Provider:   ${PROVIDERS[provider].name}`,
+        `    Model:      ${model}`,
+        `    Intensity:  ${intensity.toUpperCase()}`,
+        `    Messages:   ${history.length}`,
+        `    Tokens:     ${totalUsed.toLocaleString()} / ${CONTEXT_WINDOW.toLocaleString()}`,
+        renderUsageBar(totalUsed, CONTEXT_WINDOW),
+        "",
+      ].join("\n"));
       continue;
     }
 
@@ -805,31 +939,188 @@ async function run(
         const res = await client.models.list();
         const models = res.data
           .map((m) => m.id)
-          .filter((id) => /llama|mixtral|qwen|gemma|deepseek/i.test(id))
+          .filter((id) => PROVIDERS[provider].models.test(id))
           .sort();
-        console.log(c.bold("\n  Available Models:"));
-        models.forEach((m, i) =>
-          console.log(`    ${c.dim(`[${i}]`)} ${m}`)
-        );
-        const choice = await ask(
-          `\n  Select model (0-${models.length - 1}): `
-        );
+        console.log(c.bold(`\n  ${PROVIDERS[provider].name} Models:`));
+        models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
+        const choice = await ask(`\n  Select (0-${models.length - 1}): `);
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
           const newModel = sanitizeModelId(models[idx]);
-          console.log(c.green(`  ✔ Model: ${newModel}\n`));
+          console.log(c.green(`  ✔ ${newModel}\n`));
           const config = loadConfig();
           config.defaultModel = newModel;
           saveConfig(config);
-          // Update system prompt
-          history[0] = {
-            role: "system",
-            content: getSystemPrompt(intensity, process.cwd()),
-          };
+          history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
         }
       } catch {
         console.log(c.red("  Could not fetch models."));
       }
+      continue;
+    }
+
+    // ── /provider ──
+    if (input === "/provider") {
+      console.log(c.bold("  Switch provider:"));
+      console.log(`    ${c.dim("[1]")} Groq`);
+      console.log(`    ${c.dim("[2]")} Cerebras`);
+      const pChoice = await ask("  Select (1-2): ");
+      const newProvider: Provider = pChoice === "2" ? "cerebras" : "groq";
+
+      if (newProvider !== provider) {
+        console.log(c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`));
+        const key = await ask("  API Key: ");
+        if (key && key.length > 10) {
+          const config = loadConfig();
+          config.provider = newProvider;
+          config.apiKey = key;
+          config.defaultModel = PROVIDERS[newProvider].defaultModel;
+          saveConfig(config);
+          console.log(c.green(`  ✔ Switched to ${PROVIDERS[newProvider].name}. Restart to apply.\n`));
+        }
+      }
+      continue;
+    }
+
+    // ── /settings ──
+    if (input === "/settings") {
+      const config = loadConfig();
+      console.log([
+        "",
+        c.bold("  Settings:"),
+        `    ${c.dim("[1]")} Change API Key`,
+        `    ${c.dim("[2]")} Switch Provider (${PROVIDERS[config.provider || "groq"].name})`,
+        `    ${c.dim("[3]")} Change Model (${config.defaultModel || "default"})`,
+        `    ${c.dim("[4]")} Change Intensity (${(config.intensity || "medium").toUpperCase()})`,
+        `    ${c.dim("[5]")} View Config`,
+        `    ${c.dim("[6]")} Reset All`,
+        "",
+      ].join("\n"));
+
+      const setting = await ask("  Select (1-6): ");
+
+      switch (setting) {
+        case "1": {
+          const key = await ask("  New API Key: ");
+          if (key && key.length > 10) {
+            config.apiKey = key;
+            saveConfig(config);
+            console.log(c.green("  ✔ API key updated.\n"));
+          }
+          break;
+        }
+        case "2": {
+          console.log(`    ${c.dim("[1]")} Groq`);
+          console.log(`    ${c.dim("[2]")} Cerebras`);
+          const p = await ask("  Select: ");
+          config.provider = p === "2" ? "cerebras" : "groq";
+          config.apiKey = ""; // force re-entry
+          config.defaultModel = PROVIDERS[config.provider].defaultModel;
+          saveConfig(config);
+          console.log(c.green(`  ✔ Provider: ${PROVIDERS[config.provider].name}. Restart to apply.\n`));
+          break;
+        }
+        case "3": {
+          try {
+            const client = new OpenAI({
+              baseURL: PROVIDERS[config.provider || "groq"].baseURL,
+              apiKey: config.apiKey,
+            });
+            const res = await client.models.list();
+            const models = res.data
+              .map((m) => m.id)
+              .filter((id) => PROVIDERS[config.provider || "groq"].models.test(id))
+              .sort();
+            console.log(c.bold("\n  Models:"));
+            models.forEach((m, i) => console.log(`    ${c.dim(`[${i}]`)} ${m}`));
+            const choice = await ask(`\n  Select (0-${models.length - 1}): `);
+            const idx = parseInt(choice, 10);
+            if (!isNaN(idx) && idx >= 0 && idx < models.length) {
+              config.defaultModel = models[idx];
+              saveConfig(config);
+              console.log(c.green(`  ✔ Model: ${models[idx]}\n`));
+            }
+          } catch {
+            console.log(c.red("  Could not fetch models."));
+          }
+          break;
+        }
+        case "4": {
+          console.log(`    ${c.dim("[1]")} Low`);
+          console.log(`    ${c.dim("[2]")} Medium`);
+          console.log(`    ${c.dim("[3]")} High`);
+          const iChoice = await ask("  Select: ");
+          const map: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
+          if (map[iChoice]) {
+            config.intensity = map[iChoice];
+            saveConfig(config);
+            console.log(c.green(`  ✔ Intensity: ${config.intensity.toUpperCase()}\n`));
+          }
+          break;
+        }
+        case "5": {
+          console.log("");
+          console.log(c.bold("  Current config:"));
+          console.log(`    Provider:   ${PROVIDERS[config.provider || "groq"].name}`);
+          console.log(`    Model:      ${config.defaultModel || "default"}`);
+          console.log(`    Intensity:  ${(config.intensity || "medium").toUpperCase()}`);
+          console.log(`    API Key:    ${config.apiKey ? config.apiKey.slice(0, 6) + "..." + config.apiKey.slice(-4) : "not set"}`);
+          console.log(`    Config:     ${CONFIG_PATH}`);
+          console.log("");
+          break;
+        }
+        case "6": {
+          const confirm = await ask(c.yellow("  Are you sure? (yes/no): "));
+          if (confirm.toLowerCase() === "yes") {
+            try { fs.unlinkSync(CONFIG_PATH); } catch { /* ok */ }
+            console.log(c.green("  ✔ Config reset. Restart to apply.\n"));
+          }
+          break;
+        }
+      }
+      continue;
+    }
+
+    // ── /search ──
+    if (input.startsWith("/search ")) {
+      const query = input.slice(8).trim();
+      if (!query) {
+        console.log(c.yellow("  Usage: /search <query>"));
+        continue;
+      }
+      console.log(c.dim(`  Searching: ${query}...`));
+      const results = await searchWeb(query);
+      console.log(formatSearchResults(results, query));
+
+      // Feed results into context
+      const resultText = results
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`)
+        .join("\n\n");
+
+      history.push({
+        role: "user",
+        content: `Web search results for "${query}":\n\n${resultText}`,
+      });
+      continue;
+    }
+
+    // ── /fetch ──
+    if (input.startsWith("/fetch ")) {
+      const url = input.slice(7).trim();
+      if (!url || !url.startsWith("http")) {
+        console.log(c.yellow("  Usage: /fetch <https://url>"));
+        continue;
+      }
+      console.log(c.dim(`  Fetching: ${url}...`));
+      const content = await fetchUrlContent(url);
+      console.log(`\n${c.dim(content.slice(0, 3000))}`);
+      if (content.length > 3000) console.log(c.dim(`\n  ... (${content.length} chars total)`));
+      console.log("");
+
+      history.push({
+        role: "user",
+        content: `Content from ${url}:\n\n${content}`,
+      });
       continue;
     }
 
@@ -841,8 +1132,7 @@ async function run(
         continue;
       }
       try {
-        const target = path.resolve(raw);
-        process.chdir(target);
+        process.chdir(path.resolve(raw));
         const newCwd = process.cwd();
         console.log(c.green(`  ✔ ${newCwd}\n`));
         const tree = scanDirectory(newCwd, 3);
@@ -850,10 +1140,7 @@ async function run(
           console.log(c.dim("  Directory:"));
           console.log(c.dim(tree) + "\n");
         }
-        history[0] = {
-          role: "system",
-          content: getSystemPrompt(intensity, newCwd),
-        };
+        history[0] = { role: "system", content: getSystemPrompt(intensity, newCwd, provider) };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(c.red(`  ✘ ${msg}`));
@@ -862,62 +1149,61 @@ async function run(
     }
 
     // ── Update system prompt ──
-    history[0] = {
-      role: "system",
-      content: getSystemPrompt(intensity, process.cwd()),
-    };
+    history[0] = { role: "system", content: getSystemPrompt(intensity, process.cwd(), provider) };
+
+    // ── Auto-search: if the input likely needs external data ──
+    let finalInput = input;
+    if (needsWebSearch(input)) {
+      console.log(c.dim("  🔍 Auto-searching for current data..."));
+      const searchResults = await searchWeb(input, 3);
+      if (searchResults.length > 0) {
+        const searchContext = searchResults
+          .map((r) => `- ${r.title}: ${r.snippet} (${r.url})`)
+          .join("\n");
+        finalInput = `${input}\n\n[Web search results — use this context to answer accurately:]\n${searchContext}`;
+        logActivity(`Searched: ${input.slice(0, 50)}`);
+      }
+    }
 
     // Add user message
-    history.push({ role: "user", content: input });
+    history.push({ role: "user", content: finalInput });
 
-    // Trim context
+    // Trim
     const trimmed = trimHistory(history);
 
     // Temperature
-    const temp =
-      intensity === "low" ? 0.0 : intensity === "medium" ? 0.2 : 0.4;
+    const temp = intensity === "low" ? 0.0 : intensity === "medium" ? 0.2 : 0.4;
 
     // Stream response
     try {
       process.stdout.write(c.dim("  ⏳ Thinking...\r"));
-
-      const { content: reply, usage } = await streamResponse(
-        client,
-        model,
-        trimmed,
-        temp
-      );
+      const { content: reply, usage } = await streamResponse(client, model, trimmed, temp);
 
       if (!reply) {
-        console.log(c.red("  No response from model."));
+        console.log(c.red("  No response."));
         history.pop();
         continue;
       }
 
-      // Print boxed version
       console.log(formatResponse(reply) + "\n");
-
-      // Show token usage
-      if (usage.totalTokens > 0) {
-        printUsage(usage, history);
-      }
+      if (usage.totalTokens > 0) printUsage(usage, history);
 
       history.push({ role: "assistant", content: reply });
 
-      // Auto-execute bash blocks
+      // Execute bash blocks
       const blocks = extractBashBlocks(reply);
       const cwd = process.cwd();
 
       for (const block of blocks) {
         console.log(c.dim(`  ▸ ${block}`));
         const result = await execShellStreaming(block, cwd);
-
         if (result.ok) {
           console.log(c.green("  ✔ Done.\n"));
+          logActivity(`Ran: ${block.slice(0, 60)}`);
         } else {
           console.log(c.red("  ✘ Failed.\n"));
+          logActivity(`Failed: ${block.slice(0, 60)}`);
         }
-
         history.push({
           role: "user",
           content: `Terminal output:\n${result.output.slice(0, 8000)}`,
@@ -928,23 +1214,14 @@ async function run(
       const msg = err instanceof Error ? err.message : String(err);
 
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
-        console.error(
-          c.red(
-            "  ✘ Invalid API key. Delete ~/.flow-code-config and restart."
-          )
-        );
+        console.error(c.red(`  ✘ Invalid API key for ${PROVIDERS[provider].name}. Delete ~/.flow-code-config and restart.`));
       } else if (msg.includes("429")) {
-        console.error(
-          c.yellow("  ⚠ Rate limited. Wait a moment and try again.")
-        );
+        console.error(c.yellow("  ⚠ Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
-        console.error(
-          c.yellow("  ⚠ Model overloaded. Try again in a few seconds.")
-        );
+        console.error(c.yellow("  ⚠ Model overloaded. Try again."));
       } else {
         console.error(c.red(`  ✘ ${msg}`));
       }
-
       history.pop();
     }
   }
@@ -980,7 +1257,12 @@ function main(): void {
   printBanner();
 
   setup()
-    .then(({ client, model, intensity }) => run(client, model, intensity))
+    .then(({ client, model, intensity, provider }) => {
+      const config = loadConfig();
+      printDashboard(config);
+      logActivity("Started session");
+      return run(client, model, intensity, provider);
+    })
     .catch((err) => {
       console.error(c.red(`\n  ✘ Fatal: ${err.message || err}`));
       process.exit(1);
