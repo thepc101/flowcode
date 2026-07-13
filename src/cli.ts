@@ -618,7 +618,7 @@ function saveConfig(config: Config): void {
 }
 
 function sanitizeModelId(id: string): string {
-  return id.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 128);
+  return id.replace(/[^a-zA-Z0-9._/-]/g, "").slice(0, 128);
 }
 
 async function setup(): Promise<{
@@ -1327,6 +1327,15 @@ async function run(
 
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
         console.error(c.red(`  ✘ Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`));
+      } else if (msg.includes("404") || msg.includes("does not exist")) {
+        console.error(c.red(`  ✘ Model '${state.model}' not found.`));
+        console.log(c.dim("  Type /models to re-select a valid model."));
+        // Reset to default
+        state.model = PROVIDERS[state.provider].defaultModel;
+        const config = loadConfig();
+        config.defaultModel = state.model;
+        saveConfig(config);
+        console.log(c.green(`  ✔ Default: ${state.model}\n`));
       } else if (msg.includes("429")) {
         console.error(c.yellow("  ⚠ Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
