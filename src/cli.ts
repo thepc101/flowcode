@@ -1245,6 +1245,24 @@ async function run(
     }
 
     // ── Native cd ──
+    if (input === "cd" || input === "cd ~" || input === "cd $HOME") {
+      const home = os.homedir();
+      try {
+        process.chdir(home);
+        console.log(c.green(`  ✔ ${home}\n`));
+        const tree = scanDirectory(home, 3);
+        if (tree) {
+          console.log(c.dim("  Directory:"));
+          console.log(c.dim(tree) + "\n");
+        }
+        history[0] = { role: "system", content: getSystemPrompt(state.intensity, home, state.provider) };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(c.red(`  ✘ ${msg}`));
+      }
+      continue;
+    }
+
     if (input.startsWith("cd ")) {
       const raw = input.slice(3).replace(/^['"]|['"]$/g, "").trim();
       if (!raw || raw.includes("\0")) {
@@ -1252,7 +1270,8 @@ async function run(
         continue;
       }
       try {
-        process.chdir(path.resolve(raw));
+        const target = path.resolve(raw);
+        process.chdir(target);
         const newCwd = process.cwd();
         console.log(c.green(`  ✔ ${newCwd}\n`));
         const tree = scanDirectory(newCwd, 3);
@@ -1264,6 +1283,7 @@ async function run(
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(c.red(`  ✘ ${msg}`));
+        console.log(c.dim("  Tip: use full paths like C:\\Users\\name\\project or /home/user/project"));
       }
       continue;
     }
@@ -1392,31 +1412,27 @@ function main(): void {
     .then(async ({ client, model, intensity, provider }) => {
       // Ask for working directory
       console.log(c.dim(`  Current directory: ${process.cwd()}`));
-      const dirInput = await ask(c.bold("  Project directory (Enter to keep current): "));
+      const dirInput = await ask(c.bold("  Project directory (Enter to skip): "));
       if (dirInput.trim()) {
         const target = path.resolve(dirInput.trim());
         try {
           process.chdir(target);
-          console.log(c.green(`  ✔ ${process.cwd()}\n`));
+          console.log(c.green(`  ✔ Switched to: ${process.cwd()}\n`));
         } catch {
           console.log(c.yellow(`  ⚠ Could not open '${target}'. Using current.\n`));
         }
-      } else {
-        console.log("");
       }
 
       const config = loadConfig();
       printDashboard(config);
 
-      // Show login success message
-      console.log(c.green("  🎉 Login successful. Press Enter to continue."));
       if (hasSavedSession()) {
         const session = loadSession();
         if (session) {
           console.log(c.dim(`  📂 Last session: ${formatSessionAge(session.timestamp)} — type /resume to continue`));
         }
       }
-      console.log("");
+      console.log(c.green("  🎉 Ready! Type /cmds for commands, /help for help.\n"));
 
       logActivity("Started session");
       return run(client, model, intensity, provider);
