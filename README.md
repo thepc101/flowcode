@@ -1,18 +1,31 @@
 # Flow Code
 
-A lightning-fast, free, terminal-native autonomous coding agent powered by **Groq** and **Cerebras**. Open-source alternative to Claude Code.
+An autonomous coding agent that runs in your terminal. Powered by **Groq** and **Cerebras**. Open-source alternative to Claude Code.
 
-## Features
+## What It Does
 
-- **Multi-Provider** -- Groq and Cerebras API support with live switching
-- **Auto-File Writing** -- Code blocks with filenames are automatically saved to disk
-- **Auto-Search** -- Detects when questions need current data and searches the web automatically
-- **Streaming Responses** -- Real-time token-by-token output
-- **Context Usage Display** -- Visual progress bar showing token consumption
-- **Session Persistence** -- `/resume` continues your last conversation
-- **128K Context Window** -- Full leverage of Groq/Cerebras free API limits
-- **Code Box Rendering** -- Generated code appears in bordered boxes with language labels
-- **Directory Scanning** -- Shows file tree when you `cd` into a folder
+Flow Code is not just a chatbot — it's an **agent** with tools. Describe what you want and it will:
+
+1. **Read** your existing files to understand the codebase
+2. **Plan** the implementation
+3. **Write** new files and **edit** existing ones
+4. **Run** commands (build, test, git, npm, etc.)
+5. **Search** the web for docs, solutions, latest versions
+6. **Verify** the changes work
+
+All autonomously, with streaming output.
+
+## Agent Tools
+
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read any file to understand its contents |
+| `write_file` | Create or overwrite files (auto-creates directories) |
+| `edit_file` | Surgical find-and-replace edits |
+| `run_command` | Execute shell commands (build, test, git, npm) |
+| `list_directory` | Browse the file tree |
+| `search_web` | Search DuckDuckGo for current info |
+| `fetch_url` | Fetch and read web pages (docs, GitHub, Stack Overflow) |
 
 ## Installation
 
@@ -32,130 +45,70 @@ flow-code
 
 ## First Launch
 
-On first run you'll be prompted to:
+1. **Select a provider** — Groq or Cerebras
+2. **Enter your API key** — saved to `~/.flow-code-config` (mode `0o600`)
+3. **Choose a model** — fetched live from the provider
+4. **Select intensity** — Low, Medium, or High
 
-1. **Select a provider** -- Groq or Cerebras
-2. **Enter your API key** -- saved securely to `~/.flow-code-config` (mode `0o600`)
-3. **Choose a model** -- fetched live from the provider
-4. **Select intensity** -- Low, Medium, or High
+## Usage Examples
+
+```
+> Create a React todo app with TypeScript and Tailwind
+
+The agent will:
+- Create package.json, tsconfig.json, tailwind.config.js
+- Create src/App.tsx, src/index.tsx, src/index.css
+- Create public/index.html
+- Run npm install and npm start to verify
+
+> Fix the bug in auth/login.ts where JWT tokens expire too early
+
+The agent will:
+- Read the file
+- Identify the issue
+- Edit the file with the fix
+- Run tests to verify
+
+> What's the latest version of Next.js?
+
+The agent will:
+- Search the web
+- Report the current version
+- Offer to update your project
+```
 
 ## Slash Commands
 
 | Command | Description |
 |---------|-------------|
-| `cd <path>` | Switch working directory (shows file tree) |
-| `/search <query>` | Search the web via DuckDuckGo |
-| `/fetch <url>` | Fetch and display URL content |
-| `/write <file>` | Write a file manually (paste content, end with `---`) |
-| `/settings` | Open interactive settings menu |
-| `/models` | Re-select your model |
-| `/provider` | Switch between Groq and Cerebras (live, no restart) |
-| `/resume` | Resume last saved conversation |
-| `/compact` | Trim conversation history to fit context |
-| `/clear` | Reset conversation history |
-| `/cmds` | Full categorized command reference |
-| `/status` | Show provider, model, intensity, and token usage |
-| `/help` | List all commands |
-| `exit` | Quit Flow Code |
-
-## Auto-File Writing
-
-Flow Code automatically writes files when the model generates code with filenames. The model is instructed to use this format:
-
-```
-```path/to/file.ts
-<code here>
-```
-```
-
-This ensures files are auto-saved to your current working directory with parent directories created automatically.
-
-Other patterns also detected:
-- "Create/write/save file" instructions followed by a code block
-- Common filenames like `index.html`, `style.css`, `app.js` followed by code
-
-## Auto-Search
-
-Flow Code automatically detects when your prompt requires current or external information and searches the web before responding. Triggers include:
-
-- Questions about latest versions, releases, or updates
-- Comparisons ("vs", "compared to")
-- "What is", "how to", "which is best"
-- Year references (2024, 2025, 2026)
-- Price, weather, news queries
-
-Code-only tasks (create, write, build, fix) are never auto-searched.
+| `cd <path>` | Switch working directory |
+| `/search <query>` | Search the web manually |
+| `/fetch <url>` | Fetch URL content |
+| `/settings` | Configure preferences |
+| `/models` | Re-select model |
+| `/provider` | Switch Groq / Cerebras |
+| `/resume` | Resume last conversation |
+| `/clear` | Reset conversation |
+| `/compact` | Trim context |
+| `/status` | Show usage stats |
+| `exit` | Quit |
 
 ## Intensity Modes
 
 | Mode | Temperature | Behavior |
 |------|-------------|----------|
-| **Low** | 0.0 | Fast, single-file patches, transactional |
-| **Medium** | 0.2 | Standard refactoring, verifies changes compile |
-| **High** | 0.4 | Deep file tree scan, linting, tests, DevOps |
-
-## Code Generation Standards
-
-Flow Code enforces production-quality code output:
-
-- **TypeScript** -- strict mode, no `any`, interfaces, async/await, optional chaining
-- **React / Next.js** -- functional components, hooks, App Router, Tailwind CSS
-- **HTML / CSS** -- semantic elements, custom properties, flexbox/grid, mobile-first
-- **Python** -- type hints, PEP 8, f-strings, pathlib, dataclasses
-- **Bash** -- `set -euo pipefail`, quoted variables, non-interactive flags
-- **Database** -- parameterized queries, indexes, transactions
-
-## Settings Menu
-
-Run `/settings` to:
-
-1. Change API Key
-2. Switch Provider (Groq / Cerebras)
-3. Change Model (live model list)
-4. Change Intensity (Low / Medium / High)
-5. View current config (API key is masked)
-6. Reset all settings
-
-## Configuration
-
-Config is stored at `~/.flow-code-config`:
-
-```json
-{
-  "apiKey": "gsk_...",
-  "provider": "groq",
-  "defaultModel": "llama-3.3-70b-versatile",
-  "intensity": "medium"
-}
-```
-
-Activity history is stored at `~/.flow-code-activity`.
-
-## Context Window
-
-Flow Code uses a **128,000 token** context window:
-
-- System prompt + directory tree
-- Conversation history (auto-trimmed to 8k tokens)
-- Search results injected into context
-- Terminal output from auto-executed bash blocks
-
-Usage is displayed after every response:
-
-```
-Tokens: 3420 prompt + 1847 completion = 5267 total
-Context: [████████████████░░░░] 8,241 / 128,000 tokens (6%)
-```
+| **Low** | 0.0 | Fast, single-file patches |
+| **Medium** | 0.2 | Standard refactoring |
+| **High** | 0.4 | Deep scanning, tests, DevOps |
 
 ## Security
 
-- Config file saved with `0o600` permissions (owner read/write only)
-- API key masked in `/settings` view output
-- Model IDs sanitized (no injection possible)
-- Null byte prevention in `cd` paths
-- Bash output capped at 2,000 chars to prevent context overflow
+- Config saved with `0o600` permissions (owner read/write only)
+- API key masked in settings output
+- File writes restricted to current working directory
+- Null byte prevention in paths
 - Shell commands timeout after 60 seconds
-- Graceful `SIGINT`/`SIGTERM` handling
+- Graceful SIGINT/SIGTERM handling
 
 ## License
 

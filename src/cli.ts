@@ -4,15 +4,14 @@ import OpenAI from "openai";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import * as readline from "readline";
-import { spawn } from "child_process";
 import { createInterface } from "readline";
+import { spawn } from "child_process";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const HOME = os.homedir();
 const CONFIG_PATH = path.join(HOME, ".flow-code-config");
 const SESSION_PATH = path.join(HOME, ".flow-code-session");
@@ -21,20 +20,30 @@ const CONTEXT_WINDOW = 128000;
 const MAX_HISTORY_TOKENS = 8000;
 const MAX_RESPONSE_TOKENS = 4096;
 const SHELL_TIMEOUT_MS = 60_000;
-const MAX_SHELL_OUTPUT = 2000;
+const MAX_SHELL_OUTPUT = 4000;
 const MAX_WEB_CONTENT = 12000;
+const MAX_FILE_READ = 50_000;
+const MAX_TOOL_ROUNDS = 15;
 
 // ANSI
-const ESC = "\x1b[";
-const RESET = `${ESC}0m`;
-const BOLD = `${ESC}1m`;
-const DIM = `${ESC}2m`;
-const RED = `${ESC}31m`;
-const GREEN = `${ESC}32m`;
-const YELLOW = `${ESC}33m`;
-const BLUE = `${ESC}34m`;
-const MAGENTA = `${ESC}35m`;
-const CYAN = `${ESC}36m`;
+const R = "\x1b[0m";
+const B = "\x1b[1m";
+const D = "\x1b[2m";
+const RED = "\x1b[31m";
+const GRN = "\x1b[32m";
+const YEL = "\x1b[33m";
+const CYN = "\x1b[36m";
+const MAG = "\x1b[35m";
+
+const a = {
+  bold: (t: string) => `${B}${t}${R}`,
+  dim: (t: string) => `${D}${t}${R}`,
+  red: (t: string) => `${RED}${t}${R}`,
+  green: (t: string) => `${GRN}${t}${R}`,
+  yellow: (t: string) => `${YEL}${t}${R}`,
+  cyan: (t: string) => `${CYN}${t}${R}`,
+  magenta: (t: string) => `${MAG}${t}${R}`,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -90,18 +99,19 @@ interface SessionState {
   provider: Provider;
 }
 
+interface ToolResult {
+  tool_call_id: string;
+  output: string;
+  error?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Provider configuration
 // ---------------------------------------------------------------------------
 
 const PROVIDERS: Record<
   Provider,
-  {
-    name: string;
-    baseURL: string;
-    defaultModel: string;
-    modelFilter: RegExp;
-  }
+  { name: string; baseURL: string; defaultModel: string; modelFilter: RegExp }
 > = {
   groq: {
     name: "Groq",
@@ -115,21 +125,6 @@ const PROVIDERS: Record<
     defaultModel: "llama-3.3-70b",
     modelFilter: /llama|qwen/i,
   },
-};
-
-// ---------------------------------------------------------------------------
-// ANSI helpers
-// ---------------------------------------------------------------------------
-
-const ansi = {
-  bold: (t: string) => `${BOLD}${t}${RESET}`,
-  dim: (t: string) => `${DIM}${t}${RESET}`,
-  red: (t: string) => `${RED}${t}${RESET}`,
-  green: (t: string) => `${GREEN}${t}${RESET}`,
-  yellow: (t: string) => `${YELLOW}${t}${RESET}`,
-  blue: (t: string) => `${CYAN}${t}${RESET}`,
-  cyan: (t: string) => `${CYAN}${t}${RESET}`,
-  magenta: (t: string) => `${MAGENTA}${t}${RESET}`,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,7 +164,6 @@ function timeAgo(ts: number): string {
 }
 
 function safePath(p: string): string {
-  // Resolve and normalize, strip null bytes
   return path.resolve(p.replace(/\0/g, ""));
 }
 
@@ -178,23 +172,14 @@ function isPathInside(child: string, parent: string): boolean {
   return rel !== "" && !rel.startsWith("..");
 }
 
-// ---------------------------------------------------------------------------
-// Context window display
-// ---------------------------------------------------------------------------
-
 function renderUsageBar(used: number, total: number): string {
   const pct = Math.min(used / total, 1);
   const filled = Math.round(pct * 20);
   const empty = 20 - filled;
   const bar =
-    GREEN +
-    "\u2588".repeat(filled) +
-    RESET +
-    DIM +
-    "\u2591".repeat(empty) +
-    RESET;
+    GRN + "\u2588".repeat(filled) + R + D + "\u2591".repeat(empty) + R;
   const pctStr = Math.round(pct * 100) + "%";
-  return `  ${ansi.dim("Context:")} ${bar} ${ansi.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
+  return `  ${a.dim("Context:")} ${bar} ${a.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
 }
 
 function printUsage(usage: UsageInfo, history: Message[]): void {
@@ -204,7 +189,7 @@ function printUsage(usage: UsageInfo, history: Message[]): void {
   );
   console.log("");
   console.log(
-    `  ${ansi.dim("Tokens:")} ${ansi.bold(String(usage.promptTokens))} prompt + ${ansi.bold(String(usage.completionTokens))} completion = ${ansi.bold(String(usage.totalTokens))} total`
+    `  ${a.dim("Tokens:")} ${a.bold(String(usage.promptTokens))} prompt + ${a.bold(String(usage.completionTokens))} completion = ${a.bold(String(usage.totalTokens))} total`
   );
   console.log(renderUsageBar(totalUsed, CONTEXT_WINDOW));
   console.log("");
@@ -241,7 +226,7 @@ function getRecentActivity(): ActivityEntry[] {
       if (Array.isArray(entries)) return entries.slice(0, 5);
     }
   } catch {
-    // non-critical
+    // ignore
   }
   return [];
 }
@@ -282,7 +267,6 @@ function loadSession(): SessionData | null {
     if (fs.existsSync(SESSION_PATH)) {
       const raw = fs.readFileSync(SESSION_PATH, "utf-8");
       const data = JSON.parse(raw);
-      // Validate structure
       if (
         data &&
         typeof data === "object" &&
@@ -293,7 +277,7 @@ function loadSession(): SessionData | null {
       }
     }
   } catch {
-    // corrupted file, ignore
+    // corrupted
   }
   return null;
 }
@@ -314,8 +298,7 @@ function loadConfig(): Config {
     const parsed = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return fallback;
     return {
-      apiKey:
-        typeof parsed.apiKey === "string" ? parsed.apiKey : "",
+      apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
       provider: ["groq", "cerebras"].includes(parsed.provider)
         ? parsed.provider
         : "groq",
@@ -339,7 +322,7 @@ function saveConfig(config: Config): void {
       mode: 0o600,
     });
   } catch {
-    console.error(ansi.red("  Failed to save config."));
+    console.error(a.red("  Failed to save config."));
   }
 }
 
@@ -387,7 +370,6 @@ function scanDirectory(
 ): string {
   if (depth < 0) return "";
   const lines: string[] = [];
-
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const dirs = entries
@@ -406,14 +388,12 @@ function scanDirectory(
           !e.name.startsWith(".")
       )
       .sort((a, b) => a.name.localeCompare(b.name));
-
     const all = [...dirs, ...files];
     for (let i = 0; i < all.length; i++) {
       const entry = all[i];
       const isLast = i === all.length - 1;
       const conn = isLast ? "\\-- " : "|-- ";
       const childPref = isLast ? "    " : "|   ";
-
       if (entry.isDirectory()) {
         lines.push(`${prefix}${conn}${entry.name}/`);
         const sub = scanDirectory(
@@ -429,12 +409,11 @@ function scanDirectory(
   } catch {
     // permission denied
   }
-
   return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Web search (DuckDuckGo HTML)
+// Web search (DuckDuckGo)
 // ---------------------------------------------------------------------------
 
 async function searchWeb(
@@ -450,59 +429,27 @@ async function searchWeb(
       },
       signal: AbortSignal.timeout(10000),
     });
-
     if (!res.ok) return [];
-
     const html = await res.text();
     const results: SearchResult[] = [];
-
     const re =
       /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
     let m: RegExpExecArray | null;
-
     while ((m = re.exec(html)) !== null && results.length < numResults) {
       const rawUrl = m[1];
       const title = m[2].replace(/<[^>]*>/g, "").trim();
       const snippet = m[3].replace(/<[^>]*>/g, "").trim();
-
       const uddg = rawUrl.match(/uddg=([^&]+)/);
       const finalUrl = uddg ? decodeURIComponent(uddg[1]) : rawUrl;
-
       if (title && snippet) {
         results.push({ title, snippet, url: finalUrl });
       }
     }
-
     return results;
   } catch {
     return [];
   }
 }
-
-function formatSearchResults(results: SearchResult[], query: string): string {
-  if (results.length === 0) return `No results for "${query}".`;
-
-  const lines = [
-    "",
-    `  ${ansi.bold(ansi.blue("Search Results"))} ${ansi.dim(`"${query}"`)}`,
-    "",
-  ];
-
-  for (const [i, r] of results.entries()) {
-    lines.push(
-      `  ${ansi.bold(ansi.green(`${i + 1}.`))} ${ansi.bold(r.title)}`
-    );
-    lines.push(`     ${ansi.dim(r.snippet)}`);
-    lines.push(`     ${ansi.dim(r.url)}`);
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Fetch URL
-// ---------------------------------------------------------------------------
 
 async function fetchUrlContent(url: string): Promise<string> {
   try {
@@ -515,9 +462,7 @@ async function fetchUrlContent(url: string): Promise<string> {
       signal: AbortSignal.timeout(15000),
       redirect: "follow",
     });
-
     if (!res.ok) return `HTTP ${res.status}: ${res.statusText}`;
-
     const html = await res.text();
     return html
       .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -532,7 +477,385 @@ async function fetchUrlContent(url: string): Promise<string> {
       .trim()
       .slice(0, MAX_WEB_CONTENT);
   } catch (err: unknown) {
-    return `Failed: ${err instanceof Error ? err.message : "unknown error"}`;
+    return `Failed: ${err instanceof Error ? err.message : "unknown"}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions (OpenAI function calling format)
+// ---------------------------------------------------------------------------
+
+const TOOL_DEFINITIONS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description:
+        "Read the contents of a file. Returns the full file content. Use this to understand existing code before modifying it.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative path to the file",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        "Write content to a file. Creates the file and any parent directories if they don't exist. Overwrites existing files.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative path to the file",
+          },
+          content: {
+            type: "string",
+            description: "The full content to write to the file",
+          },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Edit a file by replacing specific text. Use read_file first to get the exact text to replace.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Absolute or relative path to the file",
+          },
+          old_text: {
+            type: "string",
+            description: "The exact text to find and replace (must match exactly)",
+          },
+          new_text: {
+            type: "string",
+            description: "The text to replace it with",
+          },
+        },
+        required: ["path", "old_text", "new_text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description:
+        "Execute a shell command. Returns stdout/stderr output. Use for building, testing, installing packages, git operations, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "The shell command to execute",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_directory",
+      description:
+        "List files and directories at a path. Returns a tree view of the directory structure.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description:
+              "Absolute or relative path. Defaults to current directory.",
+          },
+          depth: {
+            type: "number",
+            description: "How many levels deep to scan. Default 2.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_web",
+      description:
+        "Search the web for current information. Use for latest versions, documentation, error solutions, comparisons, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fetch_url",
+      description:
+        "Fetch and read the content of a URL. Use to read documentation, GitHub issues, Stack Overflow answers, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "The URL to fetch (must start with http:// or https://)",
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Tool execution
+// ---------------------------------------------------------------------------
+
+function isInsideCwd(filepath: string): boolean {
+  const abs = safePath(path.resolve(process.cwd(), filepath));
+  return isPathInside(abs, process.cwd()) || abs === process.cwd();
+}
+
+function showTool(name: string, detail: string): void {
+  const icon: Record<string, string> = {
+    read_file: "READ",
+    write_file: "WRITE",
+    edit_file: "EDIT",
+    run_command: "RUN",
+    list_directory: "LIST",
+    search_web: "SEARCH",
+    fetch_url: "FETCH",
+  };
+  const label = icon[name] || name.toUpperCase();
+  console.log(a.dim(`  >> ${label}: ${truncate(detail, 60)}`));
+}
+
+function execTool(
+  name: string,
+  args: Record<string, unknown>
+): ToolResult {
+  const id = ""; // set by caller
+  const cwd = process.cwd();
+
+  switch (name) {
+    case "read_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      if (!fs.existsSync(fp)) {
+        return { tool_call_id: id, output: `File not found: ${args.path}`, error: true };
+      }
+      if (!isPathInside(fp, cwd) && !fp.startsWith(cwd)) {
+        return { tool_call_id: id, output: "Access denied: path outside workspace", error: true };
+      }
+      try {
+        const stat = fs.statSync(fp);
+        if (stat.size > MAX_FILE_READ) {
+          const content = fs.readFileSync(fp, "utf-8").slice(0, MAX_FILE_READ);
+          return { tool_call_id: id, output: content + "\n\n[TRUNCATED - file too large]" };
+        }
+        return { tool_call_id: id, output: fs.readFileSync(fp, "utf-8") };
+      } catch (err: unknown) {
+        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "write_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      if (!isInsideCwd(String(args.path || ""))) {
+        return { tool_call_id: id, output: "Access denied: can only write inside workspace", error: true };
+      }
+      const content = String(args.content || "");
+      if (!content) {
+        return { tool_call_id: id, output: "Error: content is empty", error: true };
+      }
+      try {
+        const dir = path.dirname(fp);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fp, content, "utf-8");
+        const rel = path.relative(cwd, fp);
+        logActivity(`Wrote: ${rel}`);
+        return { tool_call_id: id, output: `File written: ${rel} (${content.length} chars)` };
+      } catch (err: unknown) {
+        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "edit_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      if (!isInsideCwd(String(args.path || ""))) {
+        return { tool_call_id: id, output: "Access denied: can only edit inside workspace", error: true };
+      }
+      if (!fs.existsSync(fp)) {
+        return { tool_call_id: id, output: `File not found: ${args.path}`, error: true };
+      }
+      const oldText = String(args.old_text || "");
+      const newText = String(args.new_text || "");
+      if (!oldText) {
+        return { tool_call_id: id, output: "Error: old_text is required", error: true };
+      }
+      try {
+        let content = fs.readFileSync(fp, "utf-8");
+        if (!content.includes(oldText)) {
+          return { tool_call_id: id, output: "Error: old_text not found in file. Use read_file to get exact text.", error: true };
+        }
+        content = content.replace(oldText, newText);
+        fs.writeFileSync(fp, content, "utf-8");
+        const rel = path.relative(cwd, fp);
+        logActivity(`Edited: ${rel}`);
+        return { tool_call_id: id, output: `File edited: ${rel}` };
+      } catch (err: unknown) {
+        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "run_command": {
+      const cmd = String(args.command || "");
+      if (!cmd) {
+        return { tool_call_id: id, output: "Error: command is empty", error: true };
+      }
+      // Return synchronously via spawn
+      try {
+        const child = spawn(cmd, [], {
+          cwd,
+          shell: true,
+          stdio: "pipe",
+          env: { ...process.env, FORCE_COLOR: "0" },
+        });
+        // This is sync but we need async — return placeholder
+        // Actually we need to handle this async in the tool loop
+        return { tool_call_id: id, output: `[RUNNING: ${cmd}]` };
+      } catch (err: unknown) {
+        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "list_directory": {
+      const dir = args.path
+        ? safePath(path.resolve(cwd, String(args.path)))
+        : cwd;
+      const depth = typeof args.depth === "number" ? args.depth : 2;
+      if (!fs.existsSync(dir)) {
+        return { tool_call_id: id, output: `Directory not found: ${args.path}`, error: true };
+      }
+      const tree = scanDirectory(dir, depth);
+      return { tool_call_id: id, output: tree || "(empty directory)" };
+    }
+
+    case "search_web": {
+      // Handled async in tool loop
+      return { tool_call_id: id, output: `[SEARCHING: ${args.query}]` };
+    }
+
+    case "fetch_url": {
+      // Handled async in tool loop
+      return { tool_call_id: id, output: `[FETCHING: ${args.url}]` };
+    }
+
+    default:
+      return { tool_call_id: id, output: `Unknown tool: ${name}`, error: true };
+  }
+}
+
+async function execToolAsync(
+  name: string,
+  args: Record<string, unknown>,
+  toolCallId: string
+): Promise<ToolResult> {
+  const cwd = process.cwd();
+
+  switch (name) {
+    case "run_command": {
+      const cmd = String(args.command || "");
+      showTool("run_command", cmd);
+      return new Promise((resolve) => {
+        let stdout = "";
+        let stderr = "";
+        try {
+          const child = spawn(cmd, [], {
+            cwd,
+            shell: true,
+            stdio: "pipe",
+            env: { ...process.env, FORCE_COLOR: "0" },
+          });
+          const timer = setTimeout(() => child.kill("SIGTERM"), SHELL_TIMEOUT_MS);
+          child.stdout?.on("data", (d: Buffer) => {
+            stdout += d.toString();
+            process.stdout.write(a.dim("  | ") + d.toString());
+          });
+          child.stderr?.on("data", (d: Buffer) => {
+            stderr += d.toString();
+            process.stderr.write(a.red("  ! ") + d.toString());
+          });
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            const output = (code === 0 ? stdout : stderr || stdout).slice(0, MAX_SHELL_OUTPUT);
+            logActivity(`Ran: ${truncate(cmd, 60)}`);
+            resolve({
+              tool_call_id: toolCallId,
+              output: code === 0 ? output || "(no output)" : `Exit ${code}:\n${output}`,
+              error: code !== 0,
+            });
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            resolve({ tool_call_id: toolCallId, output: err.message, error: true });
+          });
+        } catch (err: unknown) {
+          resolve({
+            tool_call_id: toolCallId,
+            output: err instanceof Error ? err.message : "spawn error",
+            error: true,
+          });
+        }
+      });
+    }
+
+    case "search_web": {
+      const query = String(args.query || "");
+      showTool("search_web", query);
+      const results = await searchWeb(query, 5);
+      if (results.length === 0) {
+        return { tool_call_id: toolCallId, output: `No results for "${query}"` };
+      }
+      const text = results
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`)
+        .join("\n\n");
+      logActivity(`Searched: ${truncate(query, 60)}`);
+      return { tool_call_id: toolCallId, output: text };
+    }
+
+    case "fetch_url": {
+      const url = String(args.url || "");
+      showTool("fetch_url", url);
+      const content = await fetchUrlContent(url);
+      logActivity(`Fetched: ${truncate(url, 60)}`);
+      return { tool_call_id: toolCallId, output: content };
+    }
+
+    default:
+      return execTool(name, args);
   }
 }
 
@@ -590,11 +913,11 @@ function renderCodeBox(lang: string, code: string): string {
   const lines = code.split("\n");
   const maxLen = Math.max(label.length + 4, ...lines.map((l) => l.length));
   const w = Math.min(maxLen + 2, 120);
-  const top = `${DIM}+-- ${label} ${"-".repeat(Math.max(0, w - label.length - 3))}+${RESET}`;
-  const bottom = `${DIM}+${"-".repeat(w)}+${RESET}`;
+  const top = `${D}+-- ${label} ${"-".repeat(Math.max(0, w - label.length - 3))}+${R}`;
+  const bottom = `${D}+${"-".repeat(w)}+${R}`;
   const body = lines.map((line) => {
     const t = line.length > w ? line.slice(0, w - 3) + "..." : line;
-    return `${DIM}|${RESET} ${t}`;
+    return `${D}|${R} ${t}`;
   });
   return [top, ...body, bottom].join("\n");
 }
@@ -619,27 +942,41 @@ function getSystemPrompt(
   const tree = scanDirectory(cwd, 1);
 
   const lines = [
-    `FLOW CODE (${pname}). Write production-quality code.`,
-    `CWD: ${cwd}`,
+    `You are Flow Code, an autonomous coding agent running in a terminal. You have access to tools that let you read, write, and edit files, run commands, search the web, and fetch URLs.`,
+    `Provider: ${pname} | CWD: ${cwd}`,
   ];
 
-  if (tree) lines.push(`Files:\n${tree}`);
+  if (tree) lines.push(`Current files:\n${tree}`);
 
   lines.push(
-    "Rules:",
-    "- Always write complete, production-ready files.",
-    "- When creating/updating files, put the filename on the first line inside the code block:",
-    "  ```path/to/file.ts",
-    "  <code here>",
-    "  ```",
-    "- This ensures files are auto-saved to disk.",
-    "- Read existing files before modifying them.",
-    "- TypeScript: no any, use interfaces, async/await, optional chaining.",
-    "- React/Next.js: functional components, hooks, App Router, Tailwind CSS.",
-    "- HTML/CSS: semantic elements, responsive, flexbox/grid.",
+    "",
+    "CAPABILITIES:",
+    "- read_file: Read any file to understand its contents",
+    "- write_file: Create or overwrite files (auto-creates directories)",
+    "- edit_file: Surgical find-and-replace edits on existing files",
+    "- run_command: Execute shell commands (build, test, git, npm, etc.)",
+    "- list_directory: Browse the file tree",
+    "- search_web: Search the web for current info, docs, solutions",
+    "- fetch_url: Fetch and read web pages (docs, Stack Overflow, GitHub)",
+    "",
+    "HOW TO WORK:",
+    "1. Understand the task. Read relevant files first.",
+    "2. Plan your approach mentally.",
+    "3. Use tools to implement changes.",
+    "4. Verify by running tests/builds.",
+    "5. Report what you did.",
+    "",
+    "RULES:",
+    "- Always read files before modifying them.",
+    "- Write complete, production-ready files.",
+    "- TypeScript: no any, use interfaces, async/await.",
+    "- React/Next.js: functional components, hooks, Tailwind.",
+    "- HTML/CSS: semantic, responsive, flexbox/grid.",
     "- Python: type hints, PEP 8, f-strings.",
     "- Bash: set -euo pipefail, quoted variables.",
-    "- For small changes, show the diff. For new files, write the full file.",
+    "- Use edit_file for small changes, write_file for new files.",
+    "- When uncertain, search the web for current best practices.",
+    "- Never guess API signatures or library versions — always check.",
   );
 
   return lines.join("\n");
@@ -652,275 +989,17 @@ function getSystemPrompt(
 function trimHistory(history: Message[]): Message[] {
   let total = 0;
   const result: Message[] = [];
-
-  // Always keep system message
   if (history.length > 0 && history[0].role === "system") {
     result.push(history[0]);
     total += estimateTokens(getMessageContent(history[0]));
   }
-
-  // Keep most recent messages that fit
   for (let i = history.length - 1; i >= 1; i--) {
     const tokens = estimateTokens(getMessageContent(history[i]));
     if (total + tokens > MAX_HISTORY_TOKENS) break;
     total += tokens;
     result.splice(1, 0, history[i]);
   }
-
   return result;
-}
-
-// ---------------------------------------------------------------------------
-// Bash block extraction
-// ---------------------------------------------------------------------------
-
-function extractBashBlocks(text: string): string[] {
-  const blocks: string[] = [];
-  const re = /```(?:bash|sh|shell|terminal)\n([\s\S]*?)```/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const block = m[1].trim();
-    if (block.length > 0 && block.length < 10000) blocks.push(block);
-  }
-  return blocks;
-}
-
-// ---------------------------------------------------------------------------
-// File writing
-// ---------------------------------------------------------------------------
-
-const KNOWN_LANG_TAGS =
-  /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php|jsx|tsx|swift|kt|toml|xml|svg|dockerfile|makefile|prisma|graphql|lua|r|dart|scala|ex|hs|clj|text|txt)$/i;
-
-const COMMON_FILENAMES = new Set([
-  "index.html",
-  "style.css",
-  "app.js",
-  "main.js",
-  "App.tsx",
-  "App.jsx",
-  "index.tsx",
-  "index.jsx",
-  "page.tsx",
-  "page.jsx",
-  "layout.tsx",
-  "layout.jsx",
-  "globals.css",
-  "tailwind.config.js",
-  "tailwind.config.ts",
-  "next.config.js",
-  "next.config.ts",
-  "vite.config.js",
-  "vite.config.ts",
-  "tsconfig.json",
-  "package.json",
-  ".env.example",
-  "README.md",
-  "app.py",
-  "main.py",
-  "server.py",
-  "requirements.txt",
-  "setup.py",
-  "pyproject.toml",
-  "Cargo.toml",
-  "main.rs",
-  "lib.rs",
-  "go.mod",
-  "main.go",
-  "Dockerfile",
-  "docker-compose.yml",
-  "docker-compose.yaml",
-  ".gitignore",
-  "Makefile",
-  "Procfile",
-]);
-
-function extractFilesFromResponse(text: string, cwd: string): FileToWrite[] {
-  const files: FileToWrite[] = [];
-  const seen = new Set<string>();
-
-  function addFile(filepath: string, content: string): void {
-    if (content.length === 0) return;
-    const abs = safePath(path.resolve(cwd, filepath));
-    // Security: don't write outside cwd
-    if (!isPathInside(abs, cwd) && abs !== cwd) return;
-    if (seen.has(abs)) return;
-    // Must look like a real file
-    if (!path.extname(abs)) return;
-    seen.add(abs);
-    files.push({ filepath: abs, content });
-  }
-
-  // Strategy 1: ```filename.ext\n...\n``` (filename as language tag)
-  const re1 = /```([^\s`]+\.[^\s`]+)\n([\s\S]*?)```/g;
-  let m: RegExpExecArray | null;
-  while ((m = re1.exec(text)) !== null) {
-    const fn = m[1].trim();
-    const content = m[2].trim();
-    if (KNOWN_LANG_TAGS.test(fn)) continue;
-    if (!fn.includes(".")) continue;
-    addFile(fn, content);
-  }
-
-  // Strategy 2: "create/write/save file <path>" + code block
-  const re2 =
-    /(?:create|write|save|make|generate)\s+(?:a\s+)?(?:new\s+)?(?:file\s+(?:called\s+|named\s+|at\s+)?)?["'`]?([^\s"'`]+\.[^\s"'`]+)["'`]?[\s\S]*?```(?:\w*)\n([\s\S]*?)```/gi;
-  while ((m = re2.exec(text)) !== null) {
-    const fn = m[1].trim();
-    const content = m[2].trim();
-    if (!fn.includes(".")) continue;
-    addFile(fn, content);
-  }
-
-  // Strategy 3: standalone filename line followed by code block
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    const fnMatch = line.match(
-      /^(?:#+\s+|\*\*)?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{1,10})(?:\*\*)?\s*$/
-    );
-    if (!fnMatch) continue;
-    const fn = fnMatch[1];
-    if (!COMMON_FILENAMES.has(fn)) continue;
-
-    const remaining = lines.slice(i + 1).join("\n");
-    const codeMatch = remaining.match(/```(\w*)\n([\s\S]*?)```/);
-    if (codeMatch && codeMatch[2].trim().length > 0) {
-      addFile(fn, codeMatch[2].trim());
-    }
-  }
-
-  // Strategy 4: path/filename.ext\n```...\n```
-  const re4 =
-    /(?:^|\n)([a-zA-Z0-9_\-\/]+\.[a-zA-Z0-9]{1,10})\s*\n```(?:\w*)\n([\s\S]*?)```/g;
-  while ((m = re4.exec(text)) !== null) {
-    const fn = m[1].trim();
-    const content = m[2].trim();
-    if (content.length === 0) continue;
-    if (KNOWN_LANG_TAGS.test(fn)) continue;
-    addFile(fn, content);
-  }
-
-  return files;
-}
-
-function writeFiles(files: FileToWrite[]): boolean {
-  let anyWritten = false;
-  for (const file of files) {
-    try {
-      const dir = path.dirname(file.filepath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(file.filepath, file.content, "utf-8");
-      const rel = path.relative(process.cwd(), file.filepath);
-      console.log(ansi.green(`  [CREATED] ${rel}`));
-      logActivity(`Created: ${rel}`);
-      anyWritten = true;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Write failed";
-      console.error(
-        ansi.red(`  [FAILED] ${path.basename(file.filepath)}: ${msg}`)
-      );
-    }
-  }
-  return anyWritten;
-}
-
-// ---------------------------------------------------------------------------
-// Auto-search detection
-// ---------------------------------------------------------------------------
-
-const SEARCH_TRIGGERS = [
-  /\blatest\b/i,
-  /\bcurrent(ly)?\b/i,
-  /\brecent(ly)?\b/i,
-  /\bwhat('s| is) the (best|new|latest|current)\b/i,
-  /\bhow (do|to|does)\b/i,
-  /\bwh?at (is|are|was|were)\b.*\b(version|release|update)\b/i,
-  /\btoday\b/i,
-  /\bthis (year|month|week)\b/i,
-  /\b20\d{2}\b/,
-  /\bvs\.?\b/i,
-  /\bcompared? to\b/i,
-  /\bnewest\b/i,
-  /\bavailable\b/i,
-  /\bsupport(ed|s|ing)?\b.*\bfor\b/i,
-  /\bwhich .*(is best|should i|recommend)\b/i,
-  /\bweather\b/i,
-  /\bnews\b/i,
-  /\bstock(s)?\b/i,
-  /\bprice\b/i,
-  /\brelease(d)?\b/i,
-];
-
-const CODE_TASK_RE =
-  /^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update|debug|test|check|run|start|stop|install|deploy)\s/i;
-
-function needsWebSearch(input: string): boolean {
-  if (CODE_TASK_RE.test(input)) return false;
-  if (input.length < 15) return false;
-  return SEARCH_TRIGGERS.some((re) => re.test(input));
-}
-
-// ---------------------------------------------------------------------------
-// Shell execution
-// ---------------------------------------------------------------------------
-
-function execShell(
-  cmd: string,
-  cwd: string
-): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-
-    try {
-      const child = spawn(cmd, [], {
-        cwd,
-        shell: true,
-        stdio: "pipe",
-        env: { ...process.env, FORCE_COLOR: "0" },
-      });
-
-      const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-      }, SHELL_TIMEOUT_MS);
-
-      child.stdout?.on("data", (data: Buffer) => {
-        const chunk = data.toString();
-        stdout += chunk;
-        process.stdout.write(ansi.dim("  | ") + chunk);
-      });
-
-      child.stderr?.on("data", (data: Buffer) => {
-        const chunk = data.toString();
-        stderr += chunk;
-        process.stderr.write(ansi.red("  ! ") + chunk);
-      });
-
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({
-          ok: code === 0,
-          output: (code === 0 ? stdout : stderr || stdout).slice(
-            0,
-            MAX_SHELL_OUTPUT
-          ),
-        });
-      });
-
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        resolve({ ok: false, output: err.message });
-      });
-    } catch (err: unknown) {
-      resolve({
-        ok: false,
-        output: err instanceof Error ? err.message : "spawn error",
-      });
-    }
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -939,24 +1018,21 @@ function ask(question: string): Promise<string> {
 }
 
 function prompt(): string {
-  return ansi.blue(`flow-code [${path.basename(process.cwd())}] > `);
+  return a.cyan(`flow-code [${path.basename(process.cwd())}] > `);
 }
 
 async function readInput(): Promise<string> {
   const first = await ask(prompt());
   if (!first) return "";
-
-  // Multiline: trailing backslash
   if (first.endsWith("\\")) {
     const lines: string[] = [first.replace(/\\$/, "")];
     while (true) {
-      const line = await ask(ansi.dim("  ... "));
+      const line = await ask(a.dim("  ... "));
       if (line === "") break;
       lines.push(line.replace(/\\$/, ""));
     }
     return lines.join("\n").trim();
   }
-
   return first;
 }
 
@@ -964,97 +1040,108 @@ async function readInput(): Promise<string> {
 // Thinking indicator
 // ---------------------------------------------------------------------------
 
+let thinkingInterval: ReturnType<typeof setInterval> | null = null;
+const SPIN = ["|", "/", "-", "\\"];
+
 function showThinking(): void {
-  process.stdout.write(ansi.dim("  Thinking...\r"));
+  let i = 0;
+  process.stdout.write(a.dim("  Thinking... \r"));
+  thinkingInterval = setInterval(() => {
+    process.stdout.write(a.dim(`  Thinking ${SPIN[i % SPIN.length]} \r`));
+    i++;
+  }, 150);
 }
 
-function clearLine(): void {
+function clearThinking(): void {
+  if (thinkingInterval) {
+    clearInterval(thinkingInterval);
+    thinkingInterval = null;
+  }
   process.stdout.write(" ".repeat(40) + "\r");
 }
 
 // ---------------------------------------------------------------------------
-// Streaming API
+// Streaming + Tool loop
 // ---------------------------------------------------------------------------
 
-async function streamResponse(
+async function streamWithTools(
   client: OpenAI,
   model: string,
   messages: Message[],
   temperature: number,
-  retries: number = 2
-): Promise<{ content: string; usage: UsageInfo }> {
-  let lastError: unknown;
+  history: Message[]
+): Promise<string> {
+  let rounds = 0;
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  while (rounds < MAX_TOOL_ROUNDS) {
+    rounds++;
+
+    // Call API
+    showThinking();
+    let response: OpenAI.Chat.Completions.ChatCompletion;
     try {
-      const stream = await client.chat.completions.create({
+      response = await client.chat.completions.create({
         model,
         messages,
         temperature,
         top_p: 0.95,
         max_tokens: MAX_RESPONSE_TOKENS,
-        stream: true,
-        stream_options: { include_usage: true },
+        tools: TOOL_DEFINITIONS,
+        tool_choice: "auto",
+        stream: false,
       });
-
-      let full = "";
-      let usage: UsageInfo = {
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-      };
-      let started = false;
-
-      for await (const chunk of stream) {
-        if (chunk.usage) {
-          usage = {
-            promptTokens: chunk.usage.prompt_tokens,
-            completionTokens: chunk.usage.completion_tokens,
-            totalTokens: chunk.usage.total_tokens,
-          };
-        }
-        const delta = chunk.choices[0]?.delta?.content;
-        if (delta) {
-          if (!started) {
-            clearLine();
-            started = true;
-          }
-          process.stdout.write(delta);
-          full += delta;
-        }
-      }
-
-      process.stdout.write("\n");
-      return { content: full, usage };
     } catch (err: unknown) {
-      lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
-
-      if (msg.includes("429") && attempt < retries) {
-        clearLine();
-        const wait = (attempt + 1) * 5;
-        console.log(
-          ansi.yellow(`  Rate limited. Retrying in ${wait}s...`)
-        );
-        await new Promise((r) => setTimeout(r, wait * 1000));
-        showThinking();
-        continue;
-      }
-
-      if (msg.includes("413") || msg.includes("too large")) {
-        clearLine();
-        console.log(
-          ansi.yellow(
-            "  Request too large. Try /compact or a shorter message."
-          )
-        );
-      }
-
+      clearThinking();
       throw err;
     }
+    clearThinking();
+
+    const choice = response.choices[0];
+    const msg = choice.message;
+
+    // If no tool calls, we're done — stream the text
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      const content = msg.content || "";
+      if (content) {
+        // Re-stream for display
+        process.stdout.write(formatResponse(content) + "\n");
+      }
+      return content;
+    }
+
+    // Process tool calls
+    messages.push(msg as Message);
+    history.push(msg as Message);
+
+    for (const tc of msg.tool_calls) {
+      const fnName = tc.function.name;
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(tc.function.arguments);
+      } catch {
+        // malformed args
+      }
+
+      showTool(fnName, JSON.stringify(args).slice(0, 80));
+
+      // Execute async tools
+      const result = await execToolAsync(fnName, args, tc.id);
+
+      // Add tool result to messages
+      const toolMsg: Message = {
+        role: "tool",
+        tool_call_id: tc.id,
+        content: result.error ? `ERROR: ${result.output}` : result.output,
+      };
+      messages.push(toolMsg);
+      history.push(toolMsg);
+    }
+
+    // Loop again — model may want to call more tools
   }
 
-  throw lastError;
+  console.log(a.yellow("  (max tool rounds reached)"));
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,14 +1150,14 @@ async function streamResponse(
 
 function printBanner(): void {
   console.clear();
-  const a = (t: string) => `${BOLD}${CYAN}${t}${RESET}`;
-  const d = (t: string) => `${DIM}${t}${RESET}`;
-  const s = (t: string) => `${BOLD}${MAGENTA}${t}${RESET}`;
+  const ac = (t: string) => `${B}${CYN}${t}${R}`;
+  const dm = (t: string) => `${D}${t}${R}`;
+  const sp = (t: string) => `${B}${MAG}${t}${R}`;
 
   console.log("");
-  console.log(`  ${s("(*)")} ${a("Flow Code")} ${d("v" + VERSION)}`);
-  console.log(`       ${d("terminal coding agent")}`);
-  console.log(`       ${d("--------------------")}`);
+  console.log(`  ${sp("(*)")} ${ac("Flow Code")} ${dm("v" + VERSION)}`);
+  console.log(`       ${dm("autonomous coding agent")}`);
+  console.log(`       ${dm("-------------------------")}`);
   console.log("");
 }
 
@@ -1080,33 +1167,34 @@ function printDashboard(config: Config): void {
   const model = config.defaultModel || provider.defaultModel;
   const cwd = process.cwd();
   const activity = getRecentActivity();
-  const d = (t: string) => `${DIM}${t}${RESET}`;
-  const b = (t: string) => `${BOLD}${t}${RESET}`;
-  const y = (t: string) => `${YELLOW}${t}${RESET}`;
-  const w = 48;
-  const line = d("-".repeat(w));
+  const dm = (t: string) => `${D}${t}${R}`;
+  const bd = (t: string) => `${B}${t}${R}`;
+  const yl = (t: string) => `${YEL}${t}${R}`;
+  const w = 50;
+  const line = dm("-".repeat(w));
 
   console.log("");
   console.log(
-    `  ${d("---")} ${b(`${CYAN}Flow Code${RESET}`)} ${d(`v${VERSION} ${"-".repeat(w - 26)}`)}`
+    `  ${dm("---")} ${bd(`${CYN}Flow Code${R}`)} ${dm(`v${VERSION} ${"-".repeat(w - 26)}`)}`
   );
   console.log(line);
-  console.log(`  ${d(`${provider.name} | ${model}`)}`);
-  console.log(`  ${d(cwd)}`);
+  console.log(`  ${dm(`${provider.name} | ${model}`)}`);
+  console.log(`  ${dm(cwd)}`);
+  console.log(`  ${dm("Tools: read, write, edit, run, list, search, fetch")}`);
 
   if (activity.length > 0) {
     console.log("");
-    console.log(`  ${b(y("Recent"))}`);
+    console.log(`  ${bd(yl("Recent"))}`);
     for (const entry of activity) {
       const ago = timeAgo(entry.time);
       const action = truncate(entry.action, 38);
-      console.log(`  ${d(ago.padEnd(10))} ${action}`);
+      console.log(`  ${dm(ago.padEnd(10))} ${action}`);
     }
   }
 
   console.log(line);
   console.log(
-    `  ${d("/cmds")} commands  ${d("/help")} help  ${d("exit")} quit`
+    `  ${dm("/cmds")} commands  ${dm("/help")} help  ${dm("exit")} quit`
   );
   console.log(line);
   console.log("");
@@ -1124,28 +1212,20 @@ async function setup(): Promise<{
 }> {
   const config = loadConfig();
 
-  // 1. Provider
   let provider: Provider = config.provider || "groq";
   if (!config.apiKey) {
-    console.log(ansi.bold("  [1/4] Select AI Provider:"));
-    console.log(
-      `    ${ansi.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`
-    );
-    console.log(
-      `    ${ansi.dim("[2]")} Cerebras -- Wafer-scale AI, blazing speed`
-    );
+    console.log(a.bold("  [1/4] Select AI Provider:"));
+    console.log(`    ${a.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`);
+    console.log(`    ${a.dim("[2]")} Cerebras -- Wafer-scale AI, blazing speed`);
     const p = await ask("  Select (1-2): ");
     provider = p === "2" ? "cerebras" : "groq";
   }
 
-  // 2. API key
   if (!config.apiKey) {
-    console.log(
-      ansi.dim(`\n  [2/4] Enter your ${PROVIDERS[provider].name} API Key:`)
-    );
+    console.log(a.dim(`\n  [2/4] Enter your ${PROVIDERS[provider].name} API Key:`));
     const key = await ask("  API Key: ");
     if (!key || key.length < 10) {
-      console.error(ansi.red("  Invalid key. Exiting."));
+      console.error(a.red("  Invalid key. Exiting."));
       process.exit(1);
     }
     config.apiKey = key;
@@ -1160,29 +1240,21 @@ async function setup(): Promise<{
     apiKey: config.apiKey,
   });
 
-  // 3. Model
   let model = sanitizeModelId(
     config.defaultModel || PROVIDERS[provider].defaultModel
   );
 
   try {
-    console.log(
-      ansi.dim(`\n  [3/4] Fetching ${PROVIDERS[provider].name} models...`)
-    );
+    console.log(a.dim(`\n  [3/4] Fetching ${PROVIDERS[provider].name} models...`));
     const res = await client.models.list();
     const models = res.data
       .map((m) => m.id)
       .filter((id) => PROVIDERS[provider].modelFilter.test(id))
       .sort();
-
     if (models.length > 0) {
-      console.log(ansi.bold("  Available Models:"));
-      models.forEach((m, i) =>
-        console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
-      );
-      const choice = await ask(
-        `\n  Select model (0-${models.length - 1}, Enter for default): `
-      );
+      console.log(a.bold("  Available Models:"));
+      models.forEach((m, i) => console.log(`    ${a.dim(`[${i}]`)} ${m}`));
+      const choice = await ask(`\n  Select model (0-${models.length - 1}, Enter for default): `);
       if (choice !== "") {
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
@@ -1191,20 +1263,15 @@ async function setup(): Promise<{
       }
     }
   } catch {
-    console.log(ansi.dim("  Could not fetch models. Using default."));
+    console.log(a.dim("  Could not fetch models. Using default."));
   }
 
-  // 4. Intensity
-  console.log(ansi.bold("\n  [4/4] Processing Mode:"));
-  console.log(`    ${ansi.dim("[1]")} Low    -- Fast, single-file patches`);
-  console.log(`    ${ansi.dim("[2]")} Medium -- Standard refactoring`);
-  console.log(`    ${ansi.dim("[3]")} High   -- Deep scanning & DevOps`);
+  console.log(a.bold("\n  [4/4] Processing Mode:"));
+  console.log(`    ${a.dim("[1]")} Low    -- Fast, single-file patches`);
+  console.log(`    ${a.dim("[2]")} Medium -- Standard refactoring`);
+  console.log(`    ${a.dim("[3]")} High   -- Deep scanning & DevOps`);
 
-  const iMap: Record<string, Intensity> = {
-    "1": "low",
-    "2": "medium",
-    "3": "high",
-  };
+  const iMap: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
   let intensity: Intensity = config.intensity || "medium";
   const choice = await ask("  Select mode (1-3): ");
   if (iMap[choice]) intensity = iMap[choice];
@@ -1215,12 +1282,8 @@ async function setup(): Promise<{
   saveConfig(config);
 
   console.log("");
-  console.log(ansi.green("  Setup complete."));
-  console.log(
-    ansi.dim(
-      `  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`
-    )
-  );
+  console.log(a.green("  Setup complete."));
+  console.log(a.dim(`  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`));
   console.log("");
 
   return { client, model, intensity, provider };
@@ -1238,20 +1301,13 @@ async function run(
 ): Promise<void> {
   const state: SessionState = { client, model, intensity, provider };
   const history: Message[] = [
-    {
-      role: "system",
-      content: getSystemPrompt(state.intensity, process.cwd(), state.provider),
-    },
+    { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) },
   ];
 
-  const updateSystemPrompt = (): void => {
+  const updateSystem = (): void => {
     history[0] = {
       role: "system",
-      content: getSystemPrompt(
-        state.intensity,
-        process.cwd(),
-        state.provider
-      ),
+      content: getSystemPrompt(state.intensity, process.cwd(), state.provider),
     };
   };
 
@@ -1261,7 +1317,7 @@ async function run(
 
     // ── Exit ──
     if (input === "exit" || input === "quit") {
-      console.log(ansi.dim("\n  Goodbye.\n"));
+      console.log(a.dim("\n  Goodbye.\n"));
       rl.close();
       process.exit(0);
     }
@@ -1271,20 +1327,22 @@ async function run(
       console.log(
         [
           "",
-          ansi.bold("  Commands:"),
-          `    ${ansi.dim("cd <path>")}        Switch directory`,
-          `    ${ansi.dim("/search <query>")}  Search the web`,
-          `    ${ansi.dim("/fetch <url>")}     Fetch URL content`,
-          `    ${ansi.dim("/write <file>")}    Write a file manually`,
-          `    ${ansi.dim("/settings")}        Configure preferences`,
-          `    ${ansi.dim("/models")}          Re-select model`,
-          `    ${ansi.dim("/provider")}        Switch Groq / Cerebras`,
-          `    ${ansi.dim("/resume")}          Resume last conversation`,
-          `    ${ansi.dim("/clear")}           Reset conversation`,
-          `    ${ansi.dim("/compact")}         Trim context`,
-          `    ${ansi.dim("/cmds")}            List all commands`,
-          `    ${ansi.dim("/status")}          Show usage stats`,
-          `    ${ansi.dim("exit")}             Quit`,
+          a.bold("  Commands:"),
+          `    ${a.dim("cd <path>")}        Switch directory`,
+          `    ${a.dim("/search <query>")}  Search the web`,
+          `    ${a.dim("/fetch <url>")}     Fetch URL content`,
+          `    ${a.dim("/settings")}        Configure preferences`,
+          `    ${a.dim("/models")}          Re-select model`,
+          `    ${a.dim("/provider")}        Switch Groq / Cerebras`,
+          `    ${a.dim("/resume")}          Resume last conversation`,
+          `    ${a.dim("/clear")}           Reset conversation`,
+          `    ${a.dim("/compact")}         Trim context`,
+          `    ${a.dim("/cmds")}            List all commands`,
+          `    ${a.dim("/status")}          Show usage stats`,
+          `    ${a.dim("exit")}             Quit`,
+          "",
+          a.dim("  The agent has tools: read, write, edit, run, list, search, fetch."),
+          a.dim("  It will autonomously use them to complete your task."),
           "",
         ].join("\n")
       );
@@ -1294,8 +1352,8 @@ async function run(
     // ── /clear ──
     if (input === "/clear") {
       history.length = 1;
-      updateSystemPrompt();
-      console.log(ansi.green("  Conversation cleared.\n"));
+      updateSystem();
+      console.log(a.green("  Conversation cleared.\n"));
       continue;
     }
 
@@ -1303,33 +1361,19 @@ async function run(
     if (input === "/resume") {
       const session = loadSession();
       if (!session) {
-        console.log(
-          ansi.yellow("  No saved session. Start a conversation first.\n")
-        );
+        console.log(a.yellow("  No saved session.\n"));
         continue;
       }
       history.length = 0;
       for (const msg of session.history) {
-        const role = msg.role as Role;
-        history.push({ role, content: msg.content });
+        history.push({ role: msg.role as Role, content: msg.content });
       }
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
-        updateSystemPrompt();
+        updateSystem();
       }
-      const count = history.filter(
-        (m) => m.role === "user" || m.role === "assistant"
-      ).length;
-      console.log(
-        ansi.green(
-          `  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`
-        )
-      );
-      console.log(
-        ansi.dim(
-          `  Model: ${session.model} | Provider: ${PROVIDERS[session.provider || "groq"].name}\n`
-        )
-      );
+      const count = history.filter((m) => m.role === "user" || m.role === "assistant").length;
+      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`));
       continue;
     }
 
@@ -1338,43 +1382,35 @@ async function run(
       console.log(
         [
           "",
-          ansi.bold(ansi.blue("  Flow Code Commands")),
-          ansi.dim("  --------------------------------------------"),
+          a.bold(a.cyan("  Flow Code Commands")),
+          a.dim("  --------------------------------------------"),
           "",
-          ansi.bold("  Navigation:"),
-          `    ${ansi.cyan("cd <path>")}            Switch working directory`,
-          `    ${ansi.cyan("cd ..")}                Go up one directory`,
-          `    ${ansi.cyan("cd ~")}                 Go to home directory`,
+          a.bold("  Navigation:"),
+          `    ${a.cyan("cd <path>")}            Switch working directory`,
+          `    ${a.cyan("cd ..")}                Go up one directory`,
+          `    ${a.cyan("cd ~")}                 Go to home directory`,
           "",
-          ansi.bold("  Web & Search:"),
-          `    ${ansi.cyan("/search <query>")}      Search the web via DuckDuckGo`,
-          `    ${ansi.cyan("/fetch <url>")}         Fetch and display URL content`,
+          a.bold("  Web & Search:"),
+          `    ${a.cyan("/search <query>")}      Search the web (also auto-detected)`,
+          `    ${a.cyan("/fetch <url>")}         Fetch and read URL content`,
           "",
-          ansi.bold("  Files:"),
-          `    ${ansi.cyan("/write <file>")}        Write a file manually (paste content)`,
-          `    ${ansi.dim("Auto-write")}             Code blocks with filenames auto-save`,
+          a.bold("  Session:"),
+          `    ${a.cyan("/resume")}              Resume last conversation`,
+          `    ${a.cyan("/clear")}               Reset conversation history`,
+          `    ${a.cyan("/compact")}             Trim history to fit context`,
           "",
-          ansi.bold("  Session Management:"),
-          `    ${ansi.cyan("/resume")}              Resume last conversation`,
-          `    ${ansi.cyan("/clear")}               Reset conversation history`,
-          `    ${ansi.cyan("/compact")}             Trim history to fit context`,
+          a.bold("  Configuration:"),
+          `    ${a.cyan("/settings")}            Open settings menu`,
+          `    ${a.cyan("/models")}              Re-select your model`,
+          `    ${a.cyan("/provider")}            Switch Groq / Cerebras`,
           "",
-          ansi.bold("  Configuration:"),
-          `    ${ansi.cyan("/settings")}            Open interactive settings menu`,
-          `    ${ansi.cyan("/models")}              Re-select your model`,
-          `    ${ansi.cyan("/provider")}            Switch between Groq / Cerebras`,
+          a.bold("  Info:"),
+          `    ${a.cyan("/status")}              Show provider, model, tokens`,
+          `    ${a.cyan("/cmds")}                Show this list`,
+          `    ${a.cyan("/help")}                Condensed help`,
+          `    ${a.cyan("exit")}                 Quit`,
           "",
-          ansi.bold("  Information:"),
-          `    ${ansi.cyan("/status")}              Show provider, model, tokens`,
-          `    ${ansi.cyan("/cmds")}                Show this command list`,
-          `    ${ansi.cyan("/help")}                Show condensed help`,
-          "",
-          ansi.bold("  Exit:"),
-          `    ${ansi.cyan("exit")}                 Quit Flow Code`,
-          `    ${ansi.cyan("quit")}                 Quit Flow Code`,
-          `    ${ansi.cyan("Ctrl+C")}               Quit Flow Code`,
-          "",
-          ansi.dim("  Multiline: end a line with \\ to continue."),
+          a.dim("  Multiline: end a line with \\ to continue."),
           "",
         ].join("\n")
       );
@@ -1387,11 +1423,7 @@ async function run(
       const compacted = trimHistory(history);
       history.length = 0;
       history.push(...compacted);
-      console.log(
-        ansi.green(
-          `  Compacted: ${before} -> ${history.length} messages.\n`
-        )
-      );
+      console.log(a.green(`  Compacted: ${before} -> ${history.length} messages.\n`));
       continue;
     }
 
@@ -1404,7 +1436,7 @@ async function run(
       console.log(
         [
           "",
-          ansi.bold("  Session:"),
+          a.bold("  Session:"),
           `    Provider:   ${PROVIDERS[state.provider].name}`,
           `    Model:      ${state.model}`,
           `    Intensity:  ${state.intensity.toUpperCase()}`,
@@ -1425,87 +1457,58 @@ async function run(
           .map((m) => m.id)
           .filter((id) => PROVIDERS[state.provider].modelFilter.test(id))
           .sort();
-        console.log(
-          ansi.bold(`\n  ${PROVIDERS[state.provider].name} Models:`)
-        );
-        models.forEach((m, i) =>
-          console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
-        );
-        const choice = await ask(
-          `\n  Select (0-${models.length - 1}): `
-        );
+        console.log(a.bold(`\n  ${PROVIDERS[state.provider].name} Models:`));
+        models.forEach((m, i) => console.log(`    ${a.dim(`[${i}]`)} ${m}`));
+        const choice = await ask(`\n  Select (0-${models.length - 1}): `);
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
           state.model = sanitizeModelId(models[idx]);
-          console.log(ansi.green(`  Model: ${state.model}\n`));
+          console.log(a.green(`  Model: ${state.model}\n`));
           const cfg = loadConfig();
           cfg.defaultModel = state.model;
           saveConfig(cfg);
-          updateSystemPrompt();
+          updateSystem();
         }
       } catch {
-        console.log(ansi.red("  Could not fetch models."));
+        console.log(a.red("  Could not fetch models."));
       }
       continue;
     }
 
     // ── /provider ──
     if (input === "/provider") {
-      console.log(ansi.bold("  Switch provider:"));
-      console.log(`    ${ansi.dim("[1]")} Groq`);
-      console.log(`    ${ansi.dim("[2]")} Cerebras`);
+      console.log(a.bold("  Switch provider:"));
+      console.log(`    ${a.dim("[1]")} Groq`);
+      console.log(`    ${a.dim("[2]")} Cerebras`);
       const p = await ask("  Select (1-2): ");
       const np: Provider = p === "2" ? "cerebras" : "groq";
-
       if (np === state.provider) {
-        console.log(
-          ansi.yellow(
-            `  Already using ${PROVIDERS[state.provider].name}.\n`
-          )
-        );
+        console.log(a.yellow(`  Already using ${PROVIDERS[state.provider].name}.\n`));
         continue;
       }
-
-      console.log(ansi.dim(`  Enter ${PROVIDERS[np].name} API Key:`));
+      console.log(a.dim(`  Enter ${PROVIDERS[np].name} API Key:`));
       const key = await ask("  API Key: ");
       if (!key || key.length < 10) {
-        console.log(ansi.red("  Invalid key. Provider not changed.\n"));
+        console.log(a.red("  Invalid key.\n"));
         continue;
       }
-
-      const nc = new OpenAI({
-        baseURL: PROVIDERS[np].baseURL,
-        apiKey: key,
-      });
-
+      const nc = new OpenAI({ baseURL: PROVIDERS[np].baseURL, apiKey: key });
       try {
-        console.log(ansi.dim(`  Connecting to ${PROVIDERS[np].name}...`));
+        console.log(a.dim(`  Connecting to ${PROVIDERS[np].name}...`));
         await nc.models.list();
-
         state.client = nc;
         state.provider = np;
         state.model = PROVIDERS[np].defaultModel;
-
         const cfg = loadConfig();
         cfg.provider = np;
         cfg.apiKey = key;
         cfg.defaultModel = state.model;
         saveConfig(cfg);
-
-        updateSystemPrompt();
-
-        console.log(
-          ansi.green(
-            `  Switched to ${PROVIDERS[np].name} | ${state.model}\n`
-          )
-        );
+        updateSystem();
+        console.log(a.green(`  Switched to ${PROVIDERS[np].name} | ${state.model}\n`));
         logActivity(`Switched to ${PROVIDERS[np].name}`);
       } catch (err: unknown) {
-        const msg =
-          err instanceof Error ? err.message : "Connection failed";
-        console.error(
-          ansi.red(`  ${PROVIDERS[np].name}: ${msg}\n`)
-        );
+        console.error(a.red(`  ${PROVIDERS[np].name}: ${err instanceof Error ? err.message : "Failed"}\n`));
       }
       continue;
     }
@@ -1516,45 +1519,38 @@ async function run(
       console.log(
         [
           "",
-          ansi.bold("  Settings:"),
-          `    ${ansi.dim("[1]")} Change API Key`,
-          `    ${ansi.dim("[2]")} Switch Provider (${PROVIDERS[cfg.provider || "groq"].name})`,
-          `    ${ansi.dim("[3]")} Change Model (${cfg.defaultModel || "default"})`,
-          `    ${ansi.dim("[4]")} Change Intensity (${(cfg.intensity || "medium").toUpperCase()})`,
-          `    ${ansi.dim("[5]")} View Config`,
-          `    ${ansi.dim("[6]")} Reset All`,
+          a.bold("  Settings:"),
+          `    ${a.dim("[1]")} Change API Key`,
+          `    ${a.dim("[2]")} Switch Provider (${PROVIDERS[cfg.provider || "groq"].name})`,
+          `    ${a.dim("[3]")} Change Model (${cfg.defaultModel || "default"})`,
+          `    ${a.dim("[4]")} Change Intensity (${(cfg.intensity || "medium").toUpperCase()})`,
+          `    ${a.dim("[5]")} View Config`,
+          `    ${a.dim("[6]")} Reset All`,
           "",
         ].join("\n")
       );
-
       const sel = await ask("  Select (1-6): ");
-
       switch (sel) {
         case "1": {
           const key = await ask("  New API Key: ");
           if (key && key.length > 10) {
             cfg.apiKey = key;
             saveConfig(cfg);
-            console.log(ansi.green("  API key updated.\n"));
+            console.log(a.green("  API key updated.\n"));
           } else {
-            console.log(ansi.yellow("  Key too short. Not saved.\n"));
+            console.log(a.yellow("  Key too short.\n"));
           }
           break;
         }
         case "2": {
-          console.log(`    ${ansi.dim("[1]")} Groq`);
-          console.log(`    ${ansi.dim("[2]")} Cerebras`);
+          console.log(`    ${a.dim("[1]")} Groq`);
+          console.log(`    ${a.dim("[2]")} Cerebras`);
           const p = await ask("  Select: ");
           cfg.provider = p === "2" ? "cerebras" : "groq";
-          cfg.apiKey = ""; // force re-entry on restart
-          cfg.defaultModel =
-            PROVIDERS[cfg.provider || "groq"].defaultModel;
+          cfg.apiKey = "";
+          cfg.defaultModel = PROVIDERS[cfg.provider || "groq"].defaultModel;
           saveConfig(cfg);
-          console.log(
-            ansi.green(
-              `  Provider: ${PROVIDERS[cfg.provider || "groq"].name}. Restart to apply.\n`
-            )
-          );
+          console.log(a.green(`  Provider: ${PROVIDERS[cfg.provider || "groq"].name}. Restart to apply.\n`));
           break;
         }
         case "3": {
@@ -1566,83 +1562,51 @@ async function run(
             const res = await cl.models.list();
             const models = res.data
               .map((m) => m.id)
-              .filter((id) =>
-                PROVIDERS[cfg.provider || "groq"].modelFilter.test(id)
-              )
+              .filter((id) => PROVIDERS[cfg.provider || "groq"].modelFilter.test(id))
               .sort();
-            console.log(ansi.bold("\n  Models:"));
-            models.forEach((m, i) =>
-              console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
-            );
-            const choice = await ask(
-              `\n  Select (0-${models.length - 1}): `
-            );
+            console.log(a.bold("\n  Models:"));
+            models.forEach((m, i) => console.log(`    ${a.dim(`[${i}]`)} ${m}`));
+            const choice = await ask(`\n  Select (0-${models.length - 1}): `);
             const idx = parseInt(choice, 10);
             if (!isNaN(idx) && idx >= 0 && idx < models.length) {
               cfg.defaultModel = models[idx];
               saveConfig(cfg);
-              console.log(
-                ansi.green(`  Model: ${models[idx]}\n`)
-              );
+              console.log(a.green(`  Model: ${models[idx]}\n`));
             }
           } catch {
-            console.log(ansi.red("  Could not fetch models."));
+            console.log(a.red("  Could not fetch models."));
           }
           break;
         }
         case "4": {
-          console.log(`    ${ansi.dim("[1]")} Low`);
-          console.log(`    ${ansi.dim("[2]")} Medium`);
-          console.log(`    ${ansi.dim("[3]")} High`);
+          console.log(`    ${a.dim("[1]")} Low`);
+          console.log(`    ${a.dim("[2]")} Medium`);
+          console.log(`    ${a.dim("[3]")} High`);
           const ic = await ask("  Select: ");
-          const map: Record<string, Intensity> = {
-            "1": "low",
-            "2": "medium",
-            "3": "high",
-          };
+          const map: Record<string, Intensity> = { "1": "low", "2": "medium", "3": "high" };
           if (map[ic]) {
             cfg.intensity = map[ic];
             saveConfig(cfg);
-            console.log(
-              ansi.green(
-                `  Intensity: ${cfg.intensity.toUpperCase()}\n`
-              )
-            );
+            console.log(a.green(`  Intensity: ${cfg.intensity.toUpperCase()}\n`));
           }
           break;
         }
         case "5": {
           console.log("");
-          console.log(ansi.bold("  Current config:"));
-          console.log(
-            `    Provider:   ${PROVIDERS[cfg.provider || "groq"].name}`
-          );
-          console.log(
-            `    Model:      ${cfg.defaultModel || "default"}`
-          );
-          console.log(
-            `    Intensity:  ${(cfg.intensity || "medium").toUpperCase()}`
-          );
-          console.log(
-            `    API Key:    ${cfg.apiKey ? cfg.apiKey.slice(0, 6) + "..." + cfg.apiKey.slice(-4) : "not set"}`
-          );
+          console.log(a.bold("  Current config:"));
+          console.log(`    Provider:   ${PROVIDERS[cfg.provider || "groq"].name}`);
+          console.log(`    Model:      ${cfg.defaultModel || "default"}`);
+          console.log(`    Intensity:  ${(cfg.intensity || "medium").toUpperCase()}`);
+          console.log(`    API Key:    ${cfg.apiKey ? cfg.apiKey.slice(0, 6) + "..." + cfg.apiKey.slice(-4) : "not set"}`);
           console.log(`    Config:     ${CONFIG_PATH}`);
           console.log("");
           break;
         }
         case "6": {
-          const confirm = await ask(
-            ansi.yellow("  Are you sure? (yes/no): ")
-          );
+          const confirm = await ask(a.yellow("  Are you sure? (yes/no): "));
           if (confirm.toLowerCase() === "yes") {
-            try {
-              fs.unlinkSync(CONFIG_PATH);
-            } catch {
-              // ok
-            }
-            console.log(
-              ansi.green("  Config reset. Restart to apply.\n")
-            );
+            try { fs.unlinkSync(CONFIG_PATH); } catch { /* ok */ }
+            console.log(a.green("  Config reset. Restart to apply.\n"));
           }
           break;
         }
@@ -1650,107 +1614,31 @@ async function run(
       continue;
     }
 
-    // ── /search ──
+    // ── /search (manual) ──
     if (input.startsWith("/search ")) {
       const query = input.slice(8).trim();
-      if (!query) {
-        console.log(ansi.yellow("  Usage: /search <query>"));
-        continue;
-      }
-      console.log(ansi.dim(`  Searching: ${query}...`));
+      if (!query) { console.log(a.yellow("  Usage: /search <query>")); continue; }
+      console.log(a.dim(`  Searching: ${query}...`));
       const results = await searchWeb(query);
-      console.log(formatSearchResults(results, query));
-
-      if (results.length > 0) {
-        const resultText = results
-          .map(
-            (r, i) =>
-              `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`
-          )
-          .join("\n\n");
-        history.push({
-          role: "user",
-          content: `Web search results for "${query}":\n\n${resultText}`,
-        });
+      if (results.length === 0) { console.log(a.dim("  No results.")); continue; }
+      for (const [i, r] of results.entries()) {
+        console.log(`  ${a.bold(a.green(`${i + 1}.`))} ${a.bold(r.title)}`);
+        console.log(`     ${a.dim(r.snippet)}`);
+        console.log(`     ${a.dim(r.url)}`);
+        console.log("");
       }
       continue;
     }
 
-    // ── /fetch ──
+    // ── /fetch (manual) ──
     if (input.startsWith("/fetch ")) {
       const url = input.slice(7).trim();
-      if (!url || !url.startsWith("http")) {
-        console.log(ansi.yellow("  Usage: /fetch <https://url>"));
-        continue;
-      }
-      console.log(ansi.dim(`  Fetching: ${url}...`));
+      if (!url || !url.startsWith("http")) { console.log(a.yellow("  Usage: /fetch <https://url>")); continue; }
+      console.log(a.dim(`  Fetching: ${url}...`));
       const content = await fetchUrlContent(url);
-      console.log(`\n${ansi.dim(content.slice(0, 3000))}`);
-      if (content.length > 3000) {
-        console.log(
-          ansi.dim(`\n  ... (${content.length} chars total)`)
-        );
-      }
+      console.log(`\n${a.dim(content.slice(0, 3000))}`);
+      if (content.length > 3000) console.log(a.dim(`\n  ... (${content.length} chars total)`));
       console.log("");
-
-      history.push({
-        role: "user",
-        content: `Content from ${url}:\n\n${content}`,
-      });
-      continue;
-    }
-
-    // ── /write ──
-    if (input.startsWith("/write ")) {
-      const rawPath = input
-        .slice(7)
-        .trim()
-        .replace(/^['"]|['"]$/g, "");
-      if (!rawPath) {
-        console.log(ansi.yellow("  Usage: /write <filepath>"));
-        console.log(
-          ansi.dim(
-            "  Paste content, end with a line containing only '---'"
-          )
-        );
-        continue;
-      }
-      const filepath = safePath(path.resolve(process.cwd(), rawPath));
-      // Security: only write inside cwd
-      if (!isPathInside(filepath, process.cwd()) && filepath !== path.join(process.cwd(), path.basename(filepath))) {
-        console.log(ansi.red("  Path must be inside current directory."));
-        continue;
-      }
-      console.log(ansi.dim(`  Writing to: ${path.relative(process.cwd(), filepath)}`));
-      console.log(
-        ansi.dim("  Paste/type content. End with '---':")
-      );
-      const lines: string[] = [];
-      while (true) {
-        const line = await ask(ansi.dim("  | "));
-        if (line.trim() === "---") break;
-        lines.push(line);
-      }
-      const content = lines.join("\n");
-      if (content.length === 0) {
-        console.log(ansi.yellow("  Empty. File not written."));
-        continue;
-      }
-      try {
-        const dir = path.dirname(filepath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        fs.writeFileSync(filepath, content, "utf-8");
-        const rel = path.relative(process.cwd(), filepath);
-        console.log(
-          ansi.green(`  Created: ${rel} (${content.length} chars)\n`)
-        );
-        logActivity(`Created: ${path.basename(filepath)}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : "Write failed";
-        console.error(ansi.red(`  ${msg}\n`));
-      }
       continue;
     }
 
@@ -1759,159 +1647,73 @@ async function run(
       const home = os.homedir();
       try {
         process.chdir(home);
-        console.log(ansi.green(`  ${home}\n`));
+        console.log(a.green(`  ${home}\n`));
         const tree = scanDirectory(home, 3);
-        if (tree) {
-          console.log(ansi.dim("  Directory:"));
-          console.log(ansi.dim(tree) + "\n");
-        }
-        updateSystemPrompt();
+        if (tree) { console.log(a.dim("  Directory:")); console.log(a.dim(tree) + "\n"); }
+        updateSystem();
       } catch (err: unknown) {
-        console.error(
-          ansi.red(`  ${err instanceof Error ? err.message : String(err)}`)
-        );
+        console.error(a.red(`  ${err instanceof Error ? err.message : String(err)}`));
       }
       continue;
     }
 
     if (input.startsWith("cd ")) {
-      const raw = input
-        .slice(3)
-        .replace(/^['"]|['"]$/g, "")
-        .trim();
-      if (!raw || raw.includes("\0")) {
-        console.error(ansi.red("  Invalid path."));
-        continue;
-      }
+      const raw = input.slice(3).replace(/^['"]|['"]$/g, "").trim();
+      if (!raw || raw.includes("\0")) { console.error(a.red("  Invalid path.")); continue; }
       try {
         const target = path.resolve(raw);
         process.chdir(target);
         const cwd = process.cwd();
-        console.log(ansi.green(`  ${cwd}\n`));
+        console.log(a.green(`  ${cwd}\n`));
         const tree = scanDirectory(cwd, 3);
-        if (tree) {
-          console.log(ansi.dim("  Directory:"));
-          console.log(ansi.dim(tree) + "\n");
-        }
-        updateSystemPrompt();
+        if (tree) { console.log(a.dim("  Directory:")); console.log(a.dim(tree) + "\n"); }
+        updateSystem();
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(ansi.red(`  ${msg}`));
-        console.log(
-          ansi.dim(
-            "  Tip: use full paths like C:\\Users\\name\\project or /home/user/project"
-          )
-        );
+        console.error(a.red(`  ${err instanceof Error ? err.message : String(err)}`));
       }
       continue;
     }
 
-    // ── Send to LLM ──
-    updateSystemPrompt();
+    // ── Send to agent (with tool loop) ──
+    updateSystem();
 
-    // Auto-search
-    let finalInput = input;
-    if (needsWebSearch(input)) {
-      console.log(ansi.dim("  Searching the web..."));
-      const sr = await searchWeb(input, 3);
-      if (sr.length > 0) {
-        const ctx = sr
-          .map((r) => `- ${r.title}: ${r.snippet} (${r.url})`)
-          .join("\n");
-        finalInput = `${input}\n\n[Web search results:]\n${ctx}`;
-        logActivity(`Searched: ${input.slice(0, 50)}`);
-      }
-    }
-
-    history.push({ role: "user", content: finalInput });
+    history.push({ role: "user", content: input });
     const trimmed = trimHistory(history);
     const temp =
-      state.intensity === "low"
-        ? 0.0
-        : state.intensity === "medium"
-          ? 0.2
-          : 0.4;
+      state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.2 : 0.4;
 
     try {
-      showThinking();
-      const { content: reply, usage } = await streamResponse(
+      const reply = await streamWithTools(
         state.client,
         state.model,
-        trimmed,
-        temp
+        [...trimmed], // don't mutate trimmed
+        temp,
+        history
       );
 
-      if (!reply) {
-        console.log(ansi.red("  No response."));
-        history.pop();
-        continue;
+      if (reply) {
+        history.push({ role: "assistant", content: reply });
       }
 
-      console.log(formatResponse(reply) + "\n");
-      if (usage.totalTokens > 0) printUsage(usage, history);
-
-      history.push({ role: "assistant", content: reply });
-
-      // Auto-write files
-      const files = extractFilesFromResponse(reply, process.cwd());
-      if (files.length > 0) {
-        console.log(ansi.bold("  Detected files:"));
-        const wrote = writeFiles(files);
-        if (wrote) logActivity(`Auto-wrote ${files.length} file(s)`);
-        console.log("");
-      }
-
-      // Auto-execute bash
-      const blocks = extractBashBlocks(reply);
-      const cwd = process.cwd();
-      for (const block of blocks) {
-        console.log(ansi.dim(`  > ${block}`));
-        const result = await execShell(block, cwd);
-        if (result.ok) {
-          console.log(ansi.green("  Done.\n"));
-          logActivity(`Ran: ${block.slice(0, 60)}`);
-        } else {
-          console.log(ansi.red("  Failed.\n"));
-          logActivity(`Failed: ${block.slice(0, 60)}`);
-        }
-        history.push({
-          role: "user",
-          content: `Terminal output:\n${result.output}`,
-        });
-      }
-
-      saveSession(
-        history,
-        state.model,
-        state.provider,
-        state.intensity
-      );
+      saveSession(history, state.model, state.provider, state.intensity);
     } catch (err: unknown) {
-      clearLine();
+      clearThinking();
       const msg = err instanceof Error ? err.message : String(err);
-
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
-        console.error(
-          ansi.red(
-            `  Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`
-          )
-        );
+        console.error(a.red(`  Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`));
       } else if (msg.includes("404") || msg.includes("does not exist")) {
-        console.error(
-          ansi.red(`  Model '${state.model}' not found.`)
-        );
-        console.log(ansi.dim("  Type /models to re-select."));
+        console.error(a.red(`  Model '${state.model}' not found.`));
+        console.log(a.dim("  Type /models to re-select."));
         state.model = PROVIDERS[state.provider].defaultModel;
         const cfg = loadConfig();
         cfg.defaultModel = state.model;
         saveConfig(cfg);
-        console.log(ansi.green(`  Default: ${state.model}\n`));
       } else if (msg.includes("429")) {
-        console.error(ansi.yellow("  Rate limited. Wait a moment."));
+        console.error(a.yellow("  Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
-        console.error(ansi.yellow("  Model overloaded. Try again."));
+        console.error(a.yellow("  Model overloaded. Try again."));
       } else {
-        console.error(ansi.red(`  ${msg}`));
+        console.error(a.red(`  ${msg}`));
       }
       history.pop();
     }
@@ -1924,24 +1726,16 @@ async function run(
 
 function main(): void {
   rl.on("close", () => process.exit(0));
-
   process.on("SIGINT", () => {
-    console.log(ansi.dim("\n\n  Goodbye.\n"));
+    clearThinking();
+    console.log(a.dim("\n\n  Goodbye.\n"));
     rl.close();
     process.exit(0);
   });
-
-  process.on("SIGTERM", () => {
-    rl.close();
-    process.exit(0);
-  });
-
-  process.on("unhandledRejection", (err) => {
-    console.error(ansi.red(`\n  Unhandled: ${err}`));
-  });
-
+  process.on("SIGTERM", () => { rl.close(); process.exit(0); });
+  process.on("unhandledRejection", (err) => console.error(a.red(`\n  Unhandled: ${err}`)));
   process.on("uncaughtException", (err) => {
-    console.error(ansi.red(`\n  Uncaught: ${err.message}`));
+    console.error(a.red(`\n  Uncaught: ${err.message}`));
     process.exit(1);
   });
 
@@ -1949,28 +1743,15 @@ function main(): void {
 
   setup()
     .then(async ({ client, model, intensity, provider }) => {
-      console.log(
-        ansi.dim(`  Working directory: ${process.cwd()}`)
-      );
-      const dirInput = await ask(
-        ansi.bold("  Project directory (Enter to skip): ")
-      );
+      console.log(a.dim(`  Working directory: ${process.cwd()}`));
+      const dirInput = await ask(a.bold("  Project directory (Enter to skip): "));
       if (dirInput.trim()) {
-        const cleaned = dirInput
-          .trim()
-          .replace(/^['"]|['"]$/g, "");
-        const target = path.resolve(cleaned);
+        const target = path.resolve(dirInput.trim().replace(/^['"]|['"]$/g, ""));
         try {
           process.chdir(target);
-          console.log(
-            ansi.green(`  Switched to: ${process.cwd()}\n`)
-          );
+          console.log(a.green(`  Switched to: ${process.cwd()}\n`));
         } catch {
-          console.log(
-            ansi.yellow(
-              `  Could not open '${target}'. Using current.\n`
-            )
-          );
+          console.log(a.yellow(`  Could not open '${target}'. Using current.\n`));
         }
       }
 
@@ -1980,24 +1761,16 @@ function main(): void {
       if (hasSavedSession()) {
         const session = loadSession();
         if (session) {
-          console.log(
-            ansi.dim(
-              `  Last session: ${timeAgo(session.timestamp)} -- type /resume to continue`
-            )
-          );
+          console.log(a.dim(`  Last session: ${timeAgo(session.timestamp)} -- type /resume`));
         }
       }
-      console.log(
-        ansi.green("  Ready! Type /cmds for commands.\n")
-      );
+      console.log(a.green("  Ready! Describe what you want to build.\n"));
 
       logActivity("Started session");
       return run(client, model, intensity, provider);
     })
     .catch((err) => {
-      console.error(
-        ansi.red(`\n  Fatal: ${err.message || err}`)
-      );
+      console.error(a.red(`\n  Fatal: ${err.message || err}`));
       process.exit(1);
     });
 }
