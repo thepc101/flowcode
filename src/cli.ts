@@ -6,27 +6,35 @@ import * as path from "path";
 import * as os from "os";
 import * as readline from "readline";
 import { spawn } from "child_process";
+import { createInterface } from "readline";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const CONFIG_PATH = path.join(os.homedir(), ".flow-code-config");
-const SESSION_PATH = path.join(os.homedir(), ".flow-code-session");
-const ACTIVITY_PATH = path.join(os.homedir(), ".flow-code-activity");
+const VERSION = "1.2.0";
+const HOME = os.homedir();
+const CONFIG_PATH = path.join(HOME, ".flow-code-config");
+const SESSION_PATH = path.join(HOME, ".flow-code-session");
+const ACTIVITY_PATH = path.join(HOME, ".flow-code-activity");
 const CONTEXT_WINDOW = 128000;
 const MAX_HISTORY_TOKENS = 8000;
 const MAX_RESPONSE_TOKENS = 4096;
-const VERSION = "1.1.0";
+const SHELL_TIMEOUT_MS = 60_000;
+const MAX_SHELL_OUTPUT = 2000;
+const MAX_WEB_CONTENT = 12000;
 
-const CYAN = "\x1b[36m";
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const MAGENTA = "\x1b[35m";
+// ANSI
+const ESC = "\x1b[";
+const RESET = `${ESC}0m`;
+const BOLD = `${ESC}1m`;
+const DIM = `${ESC}2m`;
+const RED = `${ESC}31m`;
+const GREEN = `${ESC}32m`;
+const YELLOW = `${ESC}33m`;
+const BLUE = `${ESC}34m`;
+const MAGENTA = `${ESC}35m`;
+const CYAN = `${ESC}36m`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,6 +42,7 @@ const MAGENTA = "\x1b[35m";
 
 type Intensity = "low" | "medium" | "high";
 type Provider = "groq" | "cerebras";
+type Role = "system" | "user" | "assistant";
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 interface Config {
@@ -56,7 +65,7 @@ interface SearchResult {
 }
 
 interface FileToWrite {
-  path: string;
+  filepath: string;
   content: string;
 }
 
@@ -85,23 +94,26 @@ interface SessionState {
 // Provider configuration
 // ---------------------------------------------------------------------------
 
-const PROVIDERS: Record<Provider, {
-  name: string;
-  baseURL: string;
-  defaultModel: string;
-  models: RegExp;
-}> = {
+const PROVIDERS: Record<
+  Provider,
+  {
+    name: string;
+    baseURL: string;
+    defaultModel: string;
+    modelFilter: RegExp;
+  }
+> = {
   groq: {
     name: "Groq",
     baseURL: "https://api.groq.com/openai/v1",
     defaultModel: "llama-3.3-70b-versatile",
-    models: /llama|mixtral|qwen|gemma|deepseek/i,
+    modelFilter: /llama|mixtral|qwen|gemma|deepseek/i,
   },
   cerebras: {
     name: "Cerebras",
     baseURL: "https://api.cerebras.ai/v1",
     defaultModel: "llama-3.3-70b",
-    models: /llama|qwen/i,
+    modelFilter: /llama|qwen/i,
   },
 };
 
@@ -109,23 +121,61 @@ const PROVIDERS: Record<Provider, {
 // ANSI helpers
 // ---------------------------------------------------------------------------
 
-const c = {
+const ansi = {
+  bold: (t: string) => `${BOLD}${t}${RESET}`,
+  dim: (t: string) => `${DIM}${t}${RESET}`,
+  red: (t: string) => `${RED}${t}${RESET}`,
+  green: (t: string) => `${GREEN}${t}${RESET}`,
+  yellow: (t: string) => `${YELLOW}${t}${RESET}`,
   blue: (t: string) => `${CYAN}${t}${RESET}`,
   cyan: (t: string) => `${CYAN}${t}${RESET}`,
-  green: (t: string) => `${GREEN}${t}${RESET}`,
-  red: (t: string) => `${RED}${t}${RESET}`,
-  dim: (t: string) => `${DIM}${t}${RESET}`,
-  bold: (t: string) => `${BOLD}${t}${RESET}`,
-  yellow: (t: string) => `${YELLOW}${t}${RESET}`,
   magenta: (t: string) => `${MAGENTA}${t}${RESET}`,
 };
 
 // ---------------------------------------------------------------------------
-// Token estimation
+// Utility
 // ---------------------------------------------------------------------------
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.5);
+}
+
+function getMessageContent(msg: Message): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((p) => ("text" in p ? p.text : "")).join("");
+  }
+  return "";
+}
+
+function sanitizeModelId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9._/-]/g, "").slice(0, 128);
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max - 3) + "..." : str;
+}
+
+function timeAgo(ts: number): string {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return `${Math.floor(days / 7)}w ago`;
+}
+
+function safePath(p: string): string {
+  // Resolve and normalize, strip null bytes
+  return path.resolve(p.replace(/\0/g, ""));
+}
+
+function isPathInside(child: string, parent: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel !== "" && !rel.startsWith("..");
 }
 
 // ---------------------------------------------------------------------------
@@ -136,134 +186,28 @@ function renderUsageBar(used: number, total: number): string {
   const pct = Math.min(used / total, 1);
   const filled = Math.round(pct * 20);
   const empty = 20 - filled;
-  const bar = GREEN + "\u2588".repeat(filled) + RESET + DIM + "\u2591".repeat(empty) + RESET;
+  const bar =
+    GREEN +
+    "\u2588".repeat(filled) +
+    RESET +
+    DIM +
+    "\u2591".repeat(empty) +
+    RESET;
   const pctStr = Math.round(pct * 100) + "%";
-  return `  ${c.dim("Context:")} ${bar} ${c.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
+  return `  ${ansi.dim("Context:")} ${bar} ${ansi.dim(`${used.toLocaleString()} / ${total.toLocaleString()} tokens (${pctStr})`)}`;
 }
 
 function printUsage(usage: UsageInfo, history: Message[]): void {
-  const totalUsed = history.reduce((acc, msg) => {
-    const content = getMessageContent(msg);
-    return acc + estimateTokens(content);
-  }, 0);
-
+  const totalUsed = history.reduce(
+    (acc, msg) => acc + estimateTokens(getMessageContent(msg)),
+    0
+  );
   console.log("");
   console.log(
-    `  ${c.dim("Tokens:")} ${c.bold(String(usage.promptTokens))} prompt + ${c.bold(String(usage.completionTokens))} completion = ${c.bold(String(usage.totalTokens))} total`
+    `  ${ansi.dim("Tokens:")} ${ansi.bold(String(usage.promptTokens))} prompt + ${ansi.bold(String(usage.completionTokens))} completion = ${ansi.bold(String(usage.totalTokens))} total`
   );
   console.log(renderUsageBar(totalUsed, CONTEXT_WINDOW));
   console.log("");
-}
-
-// ---------------------------------------------------------------------------
-// Message content extraction
-// ---------------------------------------------------------------------------
-
-function getMessageContent(msg: Message): string {
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content.map((p) => ("text" in p ? p.text : "")).join("");
-  }
-  return "";
-}
-
-// ---------------------------------------------------------------------------
-// Web search - DuckDuckGo, no API key needed
-// ---------------------------------------------------------------------------
-
-async function searchWeb(query: string, numResults: number = 5): Promise<SearchResult[]> {
-  try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    const html = await res.text();
-    const results: SearchResult[] = [];
-
-    const resultRegex =
-      /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-    let match: RegExpExecArray | null;
-
-    while ((match = resultRegex.exec(html)) !== null && results.length < numResults) {
-      const rawUrl = match[1];
-      const title = match[2].replace(/<[^>]*>/g, "").trim();
-      const snippet = match[3].replace(/<[^>]*>/g, "").trim();
-
-      const urlMatch = rawUrl.match(/uddg=([^&]+)/);
-      const finalUrl = urlMatch ? decodeURIComponent(urlMatch[1]) : rawUrl;
-
-      if (title && snippet) {
-        results.push({ title, snippet, url: finalUrl });
-      }
-    }
-
-    return results;
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Search failed";
-    console.error(c.red(`  Search error: ${msg}`));
-    return [];
-  }
-}
-
-function formatSearchResults(results: SearchResult[], query: string): string {
-  if (results.length === 0) {
-    return `No results found for "${query}".`;
-  }
-
-  const lines: string[] = [
-    "",
-    `  ${c.bold(c.blue("Search Results"))} ${c.dim(`for "${query}"`)}`,
-    "",
-  ];
-
-  for (const [i, r] of results.entries()) {
-    lines.push(`  ${c.bold(c.green(`${i + 1}.`))} ${c.bold(r.title)}`);
-    lines.push(`     ${c.dim(r.snippet)}`);
-    lines.push(`     ${c.dim(r.url)}`);
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Fetch URL content
-// ---------------------------------------------------------------------------
-
-async function fetchUrlContent(url: string): Promise<string> {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-
-    const html = await res.text();
-
-    const text = html
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/&nbsp;/g, " ")
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&#\d+;/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    return text.slice(0, 12000);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Fetch failed";
-    return `Failed to fetch URL: ${msg}`;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +218,9 @@ function logActivity(action: string): void {
   try {
     let entries: ActivityEntry[] = [];
     if (fs.existsSync(ACTIVITY_PATH)) {
-      entries = JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8"));
+      const raw = fs.readFileSync(ACTIVITY_PATH, "utf-8");
+      entries = JSON.parse(raw);
+      if (!Array.isArray(entries)) entries = [];
     }
     entries.unshift({ time: Date.now(), action });
     entries = entries.slice(0, 20);
@@ -283,31 +229,21 @@ function logActivity(action: string): void {
       mode: 0o600,
     });
   } catch {
-    /* ignore */
+    // non-critical
   }
 }
 
 function getRecentActivity(): ActivityEntry[] {
   try {
     if (fs.existsSync(ACTIVITY_PATH)) {
-      return JSON.parse(fs.readFileSync(ACTIVITY_PATH, "utf-8")).slice(0, 5);
+      const raw = fs.readFileSync(ACTIVITY_PATH, "utf-8");
+      const entries = JSON.parse(raw);
+      if (Array.isArray(entries)) return entries.slice(0, 5);
     }
   } catch {
-    /* ignore */
+    // non-critical
   }
   return [];
-}
-
-function timeAgo(ts: number): string {
-  const diff = Date.now() - ts;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return `${Math.floor(days / 7)}w ago`;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,17 +273,27 @@ function saveSession(
       mode: 0o600,
     });
   } catch {
-    /* ignore */
+    // non-critical
   }
 }
 
 function loadSession(): SessionData | null {
   try {
     if (fs.existsSync(SESSION_PATH)) {
-      return JSON.parse(fs.readFileSync(SESSION_PATH, "utf-8")) as SessionData;
+      const raw = fs.readFileSync(SESSION_PATH, "utf-8");
+      const data = JSON.parse(raw);
+      // Validate structure
+      if (
+        data &&
+        typeof data === "object" &&
+        Array.isArray(data.history) &&
+        typeof data.timestamp === "number"
+      ) {
+        return data as SessionData;
+      }
     }
   } catch {
-    /* ignore */
+    // corrupted file, ignore
   }
   return null;
 }
@@ -356,155 +302,45 @@ function hasSavedSession(): boolean {
   return loadSession() !== null;
 }
 
-function formatSessionAge(ts: number): string {
-  const diff = Date.now() - ts;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
-}
-
 // ---------------------------------------------------------------------------
-// Banner + Dashboard
+// Config
 // ---------------------------------------------------------------------------
 
-function printBanner(): void {
-  console.clear();
-  const accent = (t: string) => `${BOLD}${CYAN}${t}${RESET}`;
-  const dim = (t: string) => `${DIM}${t}${RESET}`;
-  const spark = (t: string) => `${BOLD}${MAGENTA}${t}${RESET}`;
-
-  console.log("");
-  console.log(`  ${spark("(*)")} ${accent("Flow Code")} ${dim("v" + VERSION)}`);
-  console.log(`       ${dim("terminal coding agent")}`);
-  console.log(`       ${dim("--------------------")}`);
-  console.log("");
-}
-
-function printDashboard(config: Config): void {
-  console.clear();
-  const provider = PROVIDERS[config.provider || "groq"];
-  const model = config.defaultModel || provider.defaultModel;
-  const cwd = process.cwd();
-  const activity = getRecentActivity();
-
-  const dim = (t: string) => `${DIM}${t}${RESET}`;
-  const bold = (t: string) => `${BOLD}${t}${RESET}`;
-  const blue = (t: string) => `${CYAN}${t}${RESET}`;
-  const yellow = (t: string) => `${YELLOW}${t}${RESET}`;
-  const w = 48;
-  const line = dim("-".repeat(w));
-
-  console.log("");
-  console.log(`  ${dim("---")} ${bold(blue("Flow Code"))} ${dim(`v${VERSION} ${"-".repeat(w - 26)}`)}`);
-  console.log(line);
-  console.log(`  ${dim(`${provider.name} | ${model}`)}`);
-  console.log(`  ${dim(cwd)}`);
-
-  if (activity.length > 0) {
-    console.log("");
-    console.log(`  ${bold(yellow("Recent"))}`);
-    for (const entry of activity) {
-      const ago = timeAgo(entry.time);
-      const action =
-        entry.action.length > 38 ? entry.action.slice(0, 35) + "..." : entry.action;
-      console.log(`  ${dim(ago.padEnd(10))} ${action}`);
-    }
+function loadConfig(): Config {
+  const fallback: Config = { apiKey: "", provider: "groq" };
+  try {
+    if (!fs.existsSync(CONFIG_PATH)) return fallback;
+    const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return fallback;
+    return {
+      apiKey:
+        typeof parsed.apiKey === "string" ? parsed.apiKey : "",
+      provider: ["groq", "cerebras"].includes(parsed.provider)
+        ? parsed.provider
+        : "groq",
+      defaultModel:
+        typeof parsed.defaultModel === "string"
+          ? parsed.defaultModel
+          : undefined,
+      intensity: ["low", "medium", "high"].includes(parsed.intensity)
+        ? parsed.intensity
+        : undefined,
+    };
+  } catch {
+    return fallback;
   }
-
-  console.log(line);
-  console.log(`  ${dim("/cmds")} commands  ${dim("/help")} help  ${dim("exit")} quit`);
-  console.log(line);
-  console.log("");
 }
 
-// ---------------------------------------------------------------------------
-// Readline
-// ---------------------------------------------------------------------------
-
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
-
-function ask(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => resolve(answer.trim()));
-  });
-}
-
-async function askMultiline(): Promise<string> {
-  const first = await ask(c.blue(`flow-code [${path.basename(process.cwd())}] > `));
-  if (!first) return "";
-
-  if (first.endsWith("\\")) {
-    const lines: string[] = [first.replace(/\\$/, "")];
-    while (true) {
-      const line = await ask(c.dim("  ... "));
-      if (line === "") break;
-      lines.push(line.replace(/\\$/, ""));
-    }
-    return lines.join("\n").trim();
+function saveConfig(config: Config): void {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } catch {
+    console.error(ansi.red("  Failed to save config."));
   }
-
-  return first;
-}
-
-// ---------------------------------------------------------------------------
-// Shell execution
-// ---------------------------------------------------------------------------
-
-function execShellStreaming(
-  cmd: string,
-  cwd: string
-): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-
-    try {
-      const child = spawn(cmd, [], {
-        cwd,
-        shell: true,
-        stdio: "pipe",
-        env: { ...process.env, FORCE_COLOR: "0" },
-      });
-
-      const timeout = setTimeout(() => {
-        child.kill("SIGTERM");
-      }, 60000);
-
-      child.stdout?.on("data", (data: Buffer) => {
-        const chunk = data.toString();
-        stdout += chunk;
-        process.stdout.write(c.dim("  | ") + chunk);
-      });
-
-      child.stderr?.on("data", (data: Buffer) => {
-        const chunk = data.toString();
-        stderr += chunk;
-        process.stderr.write(c.red("  ! ") + chunk);
-      });
-
-      child.on("close", (code) => {
-        clearTimeout(timeout);
-        resolve({
-          ok: code === 0,
-          output: code === 0 ? stdout : stderr || stdout,
-        });
-      });
-
-      child.on("error", (err) => {
-        clearTimeout(timeout);
-        resolve({ ok: false, output: err.message });
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      resolve({ ok: false, output: msg });
-    }
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -544,22 +380,30 @@ const IGNORE_FILES = new Set([
   "pnpm-lock.yaml",
 ]);
 
-function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): string {
-  const lines: string[] = [];
+function scanDirectory(
+  dir: string,
+  depth: number = 3,
+  prefix: string = ""
+): string {
   if (depth < 0) return "";
+  const lines: string[] = [];
 
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const dirs = entries
       .filter(
         (e) =>
-          e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith(".")
+          e.isDirectory() &&
+          !IGNORE_DIRS.has(e.name) &&
+          !e.name.startsWith(".")
       )
       .sort((a, b) => a.name.localeCompare(b.name));
     const files = entries
       .filter(
         (e) =>
-          e.isFile() && !IGNORE_FILES.has(e.name) && !e.name.startsWith(".")
+          e.isFile() &&
+          !IGNORE_FILES.has(e.name) &&
+          !e.name.startsWith(".")
       )
       .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -567,26 +411,129 @@ function scanDirectory(dir: string, depth: number = 3, prefix: string = ""): str
     for (let i = 0; i < all.length; i++) {
       const entry = all[i];
       const isLast = i === all.length - 1;
-      const connector = isLast ? "\\--- " : "|-- ";
-      const childPrefix = isLast ? "    " : "|   ";
+      const conn = isLast ? "\\-- " : "|-- ";
+      const childPref = isLast ? "    " : "|   ";
 
       if (entry.isDirectory()) {
-        lines.push(`${prefix}${connector}${entry.name}/`);
+        lines.push(`${prefix}${conn}${entry.name}/`);
         const sub = scanDirectory(
           path.join(dir, entry.name),
           depth - 1,
-          prefix + childPrefix
+          prefix + childPref
         );
         if (sub) lines.push(sub);
       } else {
-        lines.push(`${prefix}${connector}${entry.name}`);
+        lines.push(`${prefix}${conn}${entry.name}`);
       }
     }
   } catch {
-    /* permission denied */
+    // permission denied
   }
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Web search (DuckDuckGo HTML)
+// ---------------------------------------------------------------------------
+
+async function searchWeb(
+  query: string,
+  numResults: number = 5
+): Promise<SearchResult[]> {
+  try {
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!res.ok) return [];
+
+    const html = await res.text();
+    const results: SearchResult[] = [];
+
+    const re =
+      /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let m: RegExpExecArray | null;
+
+    while ((m = re.exec(html)) !== null && results.length < numResults) {
+      const rawUrl = m[1];
+      const title = m[2].replace(/<[^>]*>/g, "").trim();
+      const snippet = m[3].replace(/<[^>]*>/g, "").trim();
+
+      const uddg = rawUrl.match(/uddg=([^&]+)/);
+      const finalUrl = uddg ? decodeURIComponent(uddg[1]) : rawUrl;
+
+      if (title && snippet) {
+        results.push({ title, snippet, url: finalUrl });
+      }
+    }
+
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+function formatSearchResults(results: SearchResult[], query: string): string {
+  if (results.length === 0) return `No results for "${query}".`;
+
+  const lines = [
+    "",
+    `  ${ansi.bold(ansi.blue("Search Results"))} ${ansi.dim(`"${query}"`)}`,
+    "",
+  ];
+
+  for (const [i, r] of results.entries()) {
+    lines.push(
+      `  ${ansi.bold(ansi.green(`${i + 1}.`))} ${ansi.bold(r.title)}`
+    );
+    lines.push(`     ${ansi.dim(r.snippet)}`);
+    lines.push(`     ${ansi.dim(r.url)}`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Fetch URL
+// ---------------------------------------------------------------------------
+
+async function fetchUrlContent(url: string): Promise<string> {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Accept: "text/html,application/xhtml+xml",
+      },
+      signal: AbortSignal.timeout(15000),
+      redirect: "follow",
+    });
+
+    if (!res.ok) return `HTTP ${res.status}: ${res.statusText}`;
+
+    const html = await res.text();
+    return html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#\d+;/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, MAX_WEB_CONTENT);
+  } catch (err: unknown) {
+    return `Failed: ${err instanceof Error ? err.message : "unknown error"}`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,13 +589,12 @@ function renderCodeBox(lang: string, code: string): string {
   const label = LANG_LABELS[lang.toLowerCase()] || lang.toUpperCase();
   const lines = code.split("\n");
   const maxLen = Math.max(label.length + 4, ...lines.map((l) => l.length));
-  const width = Math.min(maxLen + 2, 120);
-  const top = `${DIM}+-- ${label} ${"-".repeat(Math.max(0, width - label.length - 3))}+${RESET}`;
-  const bottom = `${DIM}+${"-".repeat(width)}+${RESET}`;
+  const w = Math.min(maxLen + 2, 120);
+  const top = `${DIM}+-- ${label} ${"-".repeat(Math.max(0, w - label.length - 3))}+${RESET}`;
+  const bottom = `${DIM}+${"-".repeat(w)}+${RESET}`;
   const body = lines.map((line) => {
-    const truncated =
-      line.length > width ? line.slice(0, width - 3) + "..." : line;
-    return `${DIM}|${RESET} ${truncated}`;
+    const t = line.length > w ? line.slice(0, w - 3) + "..." : line;
+    return `${DIM}|${RESET} ${t}`;
   });
   return [top, ...body, bottom].join("\n");
 }
@@ -669,22 +615,20 @@ function getSystemPrompt(
   cwd: string,
   provider: Provider
 ): string {
-  const providerName = PROVIDERS[provider].name;
-  const dirTree = scanDirectory(cwd, 1);
+  const pname = PROVIDERS[provider].name;
+  const tree = scanDirectory(cwd, 1);
 
   const lines = [
-    `FLOW CODE (${providerName}). Write production-quality code.`,
+    `FLOW CODE (${pname}). Write production-quality code.`,
     `CWD: ${cwd}`,
   ];
 
-  if (dirTree) {
-    lines.push(`Files:\n${dirTree}`);
-  }
+  if (tree) lines.push(`Files:\n${tree}`);
 
   lines.push(
     "Rules:",
     "- Always write complete, production-ready files.",
-    "- When creating/updating files, put the filename on the first line inside the code block, e.g.:",
+    "- When creating/updating files, put the filename on the first line inside the code block:",
     "  ```path/to/file.ts",
     "  <code here>",
     "  ```",
@@ -695,159 +639,10 @@ function getSystemPrompt(
     "- HTML/CSS: semantic elements, responsive, flexbox/grid.",
     "- Python: type hints, PEP 8, f-strings.",
     "- Bash: set -euo pipefail, quoted variables.",
-    "- For small changes, just show the diff. For new files, write the full file.",
+    "- For small changes, show the diff. For new files, write the full file.",
   );
 
   return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-function loadConfig(): Config {
-  try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
-      const parsed = JSON.parse(raw);
-      if (typeof parsed === "object" && parsed !== null) {
-        return {
-          apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
-          provider: ["groq", "cerebras"].includes(parsed.provider)
-            ? parsed.provider
-            : "groq",
-          defaultModel: typeof parsed.defaultModel === "string" ? parsed.defaultModel : undefined,
-          intensity: ["low", "medium", "high"].includes(parsed.intensity)
-            ? parsed.intensity
-            : undefined,
-        };
-      }
-    }
-  } catch {
-    /* start fresh */
-  }
-  return { apiKey: "", provider: "groq" };
-}
-
-function saveConfig(config: Config): void {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
-}
-
-function sanitizeModelId(id: string): string {
-  return id.replace(/[^a-zA-Z0-9._/-]/g, "").slice(0, 128);
-}
-
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
-
-async function setup(): Promise<{
-  client: OpenAI;
-  model: string;
-  intensity: Intensity;
-  provider: Provider;
-}> {
-  const config = loadConfig();
-
-  // Provider selection
-  let provider: Provider = config.provider || "groq";
-  if (!config.apiKey) {
-    console.log(c.bold("  [1/4] Select AI Provider:"));
-    console.log(
-      `    ${c.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`
-    );
-    console.log(
-      `    ${c.dim("[2]")} Cerebras -- Wafer-scale AI, blazing speed`
-    );
-    const pChoice = await ask("  Select (1-2): ");
-    provider = pChoice === "2" ? "cerebras" : "groq";
-  }
-
-  const providerConfig = PROVIDERS[provider];
-
-  // API key
-  if (!config.apiKey) {
-    console.log(c.dim(`\n  [2/4] Enter your ${providerConfig.name} API Key:`));
-    const key = await ask("  API Key: ");
-    if (!key || key.length < 10) {
-      console.error(c.red("  Invalid key. Exiting."));
-      process.exit(1);
-    }
-    config.apiKey = key;
-    config.provider = provider;
-    saveConfig(config);
-  } else {
-    provider = config.provider || "groq";
-  }
-
-  const client = new OpenAI({
-    baseURL: PROVIDERS[provider].baseURL,
-    apiKey: config.apiKey,
-  });
-
-  // Model selection
-  let model = sanitizeModelId(
-    config.defaultModel || PROVIDERS[provider].defaultModel
-  );
-
-  try {
-    console.log(c.dim(`\n  [3/4] Fetching ${PROVIDERS[provider].name} models...`));
-    const res = await client.models.list();
-    const models = res.data
-      .map((m) => m.id)
-      .filter((id) => PROVIDERS[provider].models.test(id))
-      .sort();
-
-    if (models.length > 0) {
-      console.log(c.bold("  Available Models:"));
-      models.forEach((m, i) =>
-        console.log(`    ${c.dim(`[${i}]`)} ${m}`)
-      );
-      const choice = await ask(
-        `\n  Select model (0-${models.length - 1}, Enter for default): `
-      );
-      if (choice !== "") {
-        const idx = parseInt(choice, 10);
-        if (!isNaN(idx) && idx >= 0 && idx < models.length) {
-          model = sanitizeModelId(models[idx]);
-        }
-      }
-    }
-  } catch {
-    console.log(c.dim("  Could not fetch models. Using default."));
-  }
-
-  // Intensity
-  console.log(c.bold("\n  [4/4] Processing Mode:"));
-  console.log(`    ${c.dim("[1]")} Low    -- Fast, single-file patches`);
-  console.log(`    ${c.dim("[2]")} Medium -- Standard refactoring`);
-  console.log(`    ${c.dim("[3]")} High   -- Deep scanning & DevOps`);
-
-  const intensityMap: Record<string, Intensity> = {
-    "1": "low",
-    "2": "medium",
-    "3": "high",
-  };
-  let intensity: Intensity = config.intensity || "medium";
-  const choice = await ask("  Select mode (1-3): ");
-  if (intensityMap[choice]) intensity = intensityMap[choice];
-
-  config.defaultModel = model;
-  config.intensity = intensity;
-  config.provider = provider;
-  saveConfig(config);
-
-  console.log("");
-  console.log(c.green(`  Setup complete.`));
-  console.log(
-    c.dim(`  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`)
-  );
-  console.log("");
-
-  return { client, model, intensity, provider };
 }
 
 // ---------------------------------------------------------------------------
@@ -858,18 +653,18 @@ function trimHistory(history: Message[]): Message[] {
   let total = 0;
   const result: Message[] = [];
 
+  // Always keep system message
   if (history.length > 0 && history[0].role === "system") {
     result.push(history[0]);
     total += estimateTokens(getMessageContent(history[0]));
   }
 
+  // Keep most recent messages that fit
   for (let i = history.length - 1; i >= 1; i--) {
-    const msg = history[i];
-    const content = getMessageContent(msg);
-    const tokens = estimateTokens(content);
+    const tokens = estimateTokens(getMessageContent(history[i]));
     if (total + tokens > MAX_HISTORY_TOKENS) break;
     total += tokens;
-    result.splice(1, 0, msg);
+    result.splice(1, 0, history[i]);
   }
 
   return result;
@@ -881,21 +676,23 @@ function trimHistory(history: Message[]): Message[] {
 
 function extractBashBlocks(text: string): string[] {
   const blocks: string[] = [];
-  const regex = /```(?:bash|sh|shell)\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const block = match[1].trim();
+  const re = /```(?:bash|sh|shell|terminal)\n([\s\S]*?)```/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const block = m[1].trim();
     if (block.length > 0 && block.length < 10000) blocks.push(block);
   }
   return blocks;
 }
 
 // ---------------------------------------------------------------------------
-// File writing - auto-detect and manual /write command
+// File writing
 // ---------------------------------------------------------------------------
 
+const KNOWN_LANG_TAGS =
+  /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php|jsx|tsx|swift|kt|toml|xml|svg|dockerfile|makefile|prisma|graphql|lua|r|dart|scala|ex|hs|clj|text|txt)$/i;
+
 const COMMON_FILENAMES = new Set([
-  // Web
   "index.html",
   "style.css",
   "app.js",
@@ -915,26 +712,21 @@ const COMMON_FILENAMES = new Set([
   "next.config.ts",
   "vite.config.js",
   "vite.config.ts",
-  "webpack.config.js",
   "tsconfig.json",
   "package.json",
   ".env.example",
   "README.md",
-  // Python
   "app.py",
   "main.py",
   "server.py",
   "requirements.txt",
   "setup.py",
   "pyproject.toml",
-  // Rust
   "Cargo.toml",
   "main.rs",
   "lib.rs",
-  // Go
   "go.mod",
   "main.go",
-  // Config
   "Dockerfile",
   "docker-compose.yml",
   "docker-compose.yaml",
@@ -947,91 +739,66 @@ function extractFilesFromResponse(text: string, cwd: string): FileToWrite[] {
   const files: FileToWrite[] = [];
   const seen = new Set<string>();
 
-  // Strategy 1: Code block where the first non-empty line is a filename
-  // ```src/app.tsx\nimport ...\n```
-  // This is the primary pattern the model should use
-  const filenameBlockRegex = /```([^\s`]+\.[^\s`]+)\n([\s\S]*?)```/g;
-  let match: RegExpExecArray | null;
-  while ((match = filenameBlockRegex.exec(text)) !== null) {
-    const filename = match[1].trim();
-    const content = match[2].trim();
-
-    // Skip if it's a known language tag (not a filename)
-    const knownLangs =
-      /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php|jsx|tsx|swift|kt|toml|xml|svg|dockerfile|makefile|prisma|graphql|lua|r|dart|scala|ex|hs|clj|text|txt)$/i;
-    if (knownLangs.test(filename)) continue;
-    // Skip if it doesn't look like a real filename (must have a dot)
-    if (!filename.includes(".")) continue;
-
-    const absPath = path.resolve(cwd, filename);
-    if (!seen.has(absPath) && content.length > 0) {
-      seen.add(absPath);
-      files.push({ path: absPath, content });
-    }
+  function addFile(filepath: string, content: string): void {
+    if (content.length === 0) return;
+    const abs = safePath(path.resolve(cwd, filepath));
+    // Security: don't write outside cwd
+    if (!isPathInside(abs, cwd) && abs !== cwd) return;
+    if (seen.has(abs)) return;
+    // Must look like a real file
+    if (!path.extname(abs)) return;
+    seen.add(abs);
+    files.push({ filepath: abs, content });
   }
 
-  // Strategy 2: "create/write/save file <path>" followed by a code block
-  const createFileRegex =
+  // Strategy 1: ```filename.ext\n...\n``` (filename as language tag)
+  const re1 = /```([^\s`]+\.[^\s`]+)\n([\s\S]*?)```/g;
+  let m: RegExpExecArray | null;
+  while ((m = re1.exec(text)) !== null) {
+    const fn = m[1].trim();
+    const content = m[2].trim();
+    if (KNOWN_LANG_TAGS.test(fn)) continue;
+    if (!fn.includes(".")) continue;
+    addFile(fn, content);
+  }
+
+  // Strategy 2: "create/write/save file <path>" + code block
+  const re2 =
     /(?:create|write|save|make|generate)\s+(?:a\s+)?(?:new\s+)?(?:file\s+(?:called\s+|named\s+|at\s+)?)?["'`]?([^\s"'`]+\.[^\s"'`]+)["'`]?[\s\S]*?```(?:\w*)\n([\s\S]*?)```/gi;
-  while ((match = createFileRegex.exec(text)) !== null) {
-    const filename = match[1].trim();
-    const content = match[2].trim();
-
-    if (content.length === 0) continue;
-    if (!filename.includes(".")) continue;
-
-    const absPath = path.resolve(cwd, filename);
-    if (!seen.has(absPath)) {
-      seen.add(absPath);
-      files.push({ path: absPath, content });
-    }
+  while ((m = re2.exec(text)) !== null) {
+    const fn = m[1].trim();
+    const content = m[2].trim();
+    if (!fn.includes(".")) continue;
+    addFile(fn, content);
   }
 
-  // Strategy 3: Standalone common filenames on their own line followed by a code block
+  // Strategy 3: standalone filename line followed by code block
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    // Match lines like "index.html", "**index.html**", "## index.html", "### style.css"
-    const filenameMatch = line.match(
+    const fnMatch = line.match(
       /^(?:#+\s+|\*\*)?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{1,10})(?:\*\*)?\s*$/
     );
-    if (!filenameMatch) continue;
+    if (!fnMatch) continue;
+    const fn = fnMatch[1];
+    if (!COMMON_FILENAMES.has(fn)) continue;
 
-    const filename = filenameMatch[1];
-    if (!COMMON_FILENAMES.has(filename)) continue;
-
-    // Look for the next code block after this line
     const remaining = lines.slice(i + 1).join("\n");
     const codeMatch = remaining.match(/```(\w*)\n([\s\S]*?)```/);
     if (codeMatch && codeMatch[2].trim().length > 0) {
-      const absPath = path.resolve(cwd, filename);
-      if (!seen.has(absPath)) {
-        seen.add(absPath);
-        files.push({ path: absPath, content: codeMatch[2].trim() });
-      }
+      addFile(fn, codeMatch[2].trim());
     }
   }
 
-  // Strategy 4: File path followed by code block (src/components/Button.tsx etc.)
-  const pathFileRegex =
+  // Strategy 4: path/filename.ext\n```...\n```
+  const re4 =
     /(?:^|\n)([a-zA-Z0-9_\-\/]+\.[a-zA-Z0-9]{1,10})\s*\n```(?:\w*)\n([\s\S]*?)```/g;
-  while ((match = pathFileRegex.exec(text)) !== null) {
-    const filename = match[1].trim();
-    const content = match[2].trim();
-
+  while ((m = re4.exec(text)) !== null) {
+    const fn = m[1].trim();
+    const content = m[2].trim();
     if (content.length === 0) continue;
-    if (!filename.includes("/") && !filename.includes(".")) continue;
-
-    // Skip language tags
-    const knownLangs =
-      /^(bash|sh|shell|js|ts|py|html|css|json|yaml|yml|md|sql|go|rs|java|c|cpp|rb|php)$/i;
-    if (knownLangs.test(filename)) continue;
-
-    const absPath = path.resolve(cwd, filename);
-    if (!seen.has(absPath)) {
-      seen.add(absPath);
-      files.push({ path: absPath, content });
-    }
+    if (KNOWN_LANG_TAGS.test(fn)) continue;
+    addFile(fn, content);
   }
 
   return files;
@@ -1041,19 +808,19 @@ function writeFiles(files: FileToWrite[]): boolean {
   let anyWritten = false;
   for (const file of files) {
     try {
-      const dir = path.dirname(file.path);
+      const dir = path.dirname(file.filepath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(file.path, file.content, "utf-8");
-      const rel = path.relative(process.cwd(), file.path);
-      console.log(c.green(`  [CREATED] ${rel}`));
+      fs.writeFileSync(file.filepath, file.content, "utf-8");
+      const rel = path.relative(process.cwd(), file.filepath);
+      console.log(ansi.green(`  [CREATED] ${rel}`));
       logActivity(`Created: ${rel}`);
       anyWritten = true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Write failed";
       console.error(
-        c.red(`  [FAILED] ${path.basename(file.path)}: ${msg}`)
+        ansi.red(`  [FAILED] ${path.basename(file.filepath)}: ${msg}`)
       );
     }
   }
@@ -1087,16 +854,122 @@ const SEARCH_TRIGGERS = [
   /\brelease(d)?\b/i,
 ];
 
+const CODE_TASK_RE =
+  /^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update|debug|test|check|run|start|stop|install|deploy)\s/i;
+
 function needsWebSearch(input: string): boolean {
-  if (
-    /^(create|write|build|fix|edit|refactor|implement|add|remove|delete|update)\s/i.test(
-      input
-    )
-  ) {
-    return false;
-  }
+  if (CODE_TASK_RE.test(input)) return false;
   if (input.length < 15) return false;
   return SEARCH_TRIGGERS.some((re) => re.test(input));
+}
+
+// ---------------------------------------------------------------------------
+// Shell execution
+// ---------------------------------------------------------------------------
+
+function execShell(
+  cmd: string,
+  cwd: string
+): Promise<{ ok: boolean; output: string }> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+
+    try {
+      const child = spawn(cmd, [], {
+        cwd,
+        shell: true,
+        stdio: "pipe",
+        env: { ...process.env, FORCE_COLOR: "0" },
+      });
+
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+      }, SHELL_TIMEOUT_MS);
+
+      child.stdout?.on("data", (data: Buffer) => {
+        const chunk = data.toString();
+        stdout += chunk;
+        process.stdout.write(ansi.dim("  | ") + chunk);
+      });
+
+      child.stderr?.on("data", (data: Buffer) => {
+        const chunk = data.toString();
+        stderr += chunk;
+        process.stderr.write(ansi.red("  ! ") + chunk);
+      });
+
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({
+          ok: code === 0,
+          output: (code === 0 ? stdout : stderr || stdout).slice(
+            0,
+            MAX_SHELL_OUTPUT
+          ),
+        });
+      });
+
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ ok: false, output: err.message });
+      });
+    } catch (err: unknown) {
+      resolve({
+        ok: false,
+        output: err instanceof Error ? err.message : "spawn error",
+      });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Readline
+// ---------------------------------------------------------------------------
+
+const rl = createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+function ask(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => resolve(answer.trim()));
+  });
+}
+
+function prompt(): string {
+  return ansi.blue(`flow-code [${path.basename(process.cwd())}] > `);
+}
+
+async function readInput(): Promise<string> {
+  const first = await ask(prompt());
+  if (!first) return "";
+
+  // Multiline: trailing backslash
+  if (first.endsWith("\\")) {
+    const lines: string[] = [first.replace(/\\$/, "")];
+    while (true) {
+      const line = await ask(ansi.dim("  ... "));
+      if (line === "") break;
+      lines.push(line.replace(/\\$/, ""));
+    }
+    return lines.join("\n").trim();
+  }
+
+  return first;
+}
+
+// ---------------------------------------------------------------------------
+// Thinking indicator
+// ---------------------------------------------------------------------------
+
+function showThinking(): void {
+  process.stdout.write(ansi.dim("  Thinking...\r"));
+}
+
+function clearLine(): void {
+  process.stdout.write(" ".repeat(40) + "\r");
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,7 +997,7 @@ async function streamResponse(
         stream_options: { include_usage: true },
       });
 
-      let fullResponse = "";
+      let full = "";
       let usage: UsageInfo = {
         promptTokens: 0,
         completionTokens: 0,
@@ -1143,39 +1016,38 @@ async function streamResponse(
         const delta = chunk.choices[0]?.delta?.content;
         if (delta) {
           if (!started) {
-            process.stdout.write(" ".repeat(30) + "\r");
+            clearLine();
             started = true;
           }
           process.stdout.write(delta);
-          fullResponse += delta;
+          full += delta;
         }
       }
 
       process.stdout.write("\n");
-      return { content: fullResponse, usage };
+      return { content: full, usage };
     } catch (err: unknown) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
 
       if (msg.includes("429") && attempt < retries) {
-        process.stdout.write(" ".repeat(30) + "\r");
+        clearLine();
         const wait = (attempt + 1) * 5;
         console.log(
-          c.yellow(`  Rate limited. Retrying in ${wait}s...`)
+          ansi.yellow(`  Rate limited. Retrying in ${wait}s...`)
         );
         await new Promise((r) => setTimeout(r, wait * 1000));
-        process.stdout.write(c.dim("  Thinking...\r"));
+        showThinking();
         continue;
       }
 
       if (msg.includes("413") || msg.includes("too large")) {
-        process.stdout.write(" ".repeat(30) + "\r");
+        clearLine();
         console.log(
-          c.yellow(
-            "  Request too large. Try a shorter message or /compact to clear history."
+          ansi.yellow(
+            "  Request too large. Try /compact or a shorter message."
           )
         );
-        throw err;
       }
 
       throw err;
@@ -1186,7 +1058,176 @@ async function streamResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Main agent loop
+// Banner + Dashboard
+// ---------------------------------------------------------------------------
+
+function printBanner(): void {
+  console.clear();
+  const a = (t: string) => `${BOLD}${CYAN}${t}${RESET}`;
+  const d = (t: string) => `${DIM}${t}${RESET}`;
+  const s = (t: string) => `${BOLD}${MAGENTA}${t}${RESET}`;
+
+  console.log("");
+  console.log(`  ${s("(*)")} ${a("Flow Code")} ${d("v" + VERSION)}`);
+  console.log(`       ${d("terminal coding agent")}`);
+  console.log(`       ${d("--------------------")}`);
+  console.log("");
+}
+
+function printDashboard(config: Config): void {
+  console.clear();
+  const provider = PROVIDERS[config.provider || "groq"];
+  const model = config.defaultModel || provider.defaultModel;
+  const cwd = process.cwd();
+  const activity = getRecentActivity();
+  const d = (t: string) => `${DIM}${t}${RESET}`;
+  const b = (t: string) => `${BOLD}${t}${RESET}`;
+  const y = (t: string) => `${YELLOW}${t}${RESET}`;
+  const w = 48;
+  const line = d("-".repeat(w));
+
+  console.log("");
+  console.log(
+    `  ${d("---")} ${b(`${CYAN}Flow Code${RESET}`)} ${d(`v${VERSION} ${"-".repeat(w - 26)}`)}`
+  );
+  console.log(line);
+  console.log(`  ${d(`${provider.name} | ${model}`)}`);
+  console.log(`  ${d(cwd)}`);
+
+  if (activity.length > 0) {
+    console.log("");
+    console.log(`  ${b(y("Recent"))}`);
+    for (const entry of activity) {
+      const ago = timeAgo(entry.time);
+      const action = truncate(entry.action, 38);
+      console.log(`  ${d(ago.padEnd(10))} ${action}`);
+    }
+  }
+
+  console.log(line);
+  console.log(
+    `  ${d("/cmds")} commands  ${d("/help")} help  ${d("exit")} quit`
+  );
+  console.log(line);
+  console.log("");
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+async function setup(): Promise<{
+  client: OpenAI;
+  model: string;
+  intensity: Intensity;
+  provider: Provider;
+}> {
+  const config = loadConfig();
+
+  // 1. Provider
+  let provider: Provider = config.provider || "groq";
+  if (!config.apiKey) {
+    console.log(ansi.bold("  [1/4] Select AI Provider:"));
+    console.log(
+      `    ${ansi.dim("[1]")} Groq    -- Ultra-fast inference, open-source models`
+    );
+    console.log(
+      `    ${ansi.dim("[2]")} Cerebras -- Wafer-scale AI, blazing speed`
+    );
+    const p = await ask("  Select (1-2): ");
+    provider = p === "2" ? "cerebras" : "groq";
+  }
+
+  // 2. API key
+  if (!config.apiKey) {
+    console.log(
+      ansi.dim(`\n  [2/4] Enter your ${PROVIDERS[provider].name} API Key:`)
+    );
+    const key = await ask("  API Key: ");
+    if (!key || key.length < 10) {
+      console.error(ansi.red("  Invalid key. Exiting."));
+      process.exit(1);
+    }
+    config.apiKey = key;
+    config.provider = provider;
+    saveConfig(config);
+  } else {
+    provider = config.provider || "groq";
+  }
+
+  const client = new OpenAI({
+    baseURL: PROVIDERS[provider].baseURL,
+    apiKey: config.apiKey,
+  });
+
+  // 3. Model
+  let model = sanitizeModelId(
+    config.defaultModel || PROVIDERS[provider].defaultModel
+  );
+
+  try {
+    console.log(
+      ansi.dim(`\n  [3/4] Fetching ${PROVIDERS[provider].name} models...`)
+    );
+    const res = await client.models.list();
+    const models = res.data
+      .map((m) => m.id)
+      .filter((id) => PROVIDERS[provider].modelFilter.test(id))
+      .sort();
+
+    if (models.length > 0) {
+      console.log(ansi.bold("  Available Models:"));
+      models.forEach((m, i) =>
+        console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
+      );
+      const choice = await ask(
+        `\n  Select model (0-${models.length - 1}, Enter for default): `
+      );
+      if (choice !== "") {
+        const idx = parseInt(choice, 10);
+        if (!isNaN(idx) && idx >= 0 && idx < models.length) {
+          model = sanitizeModelId(models[idx]);
+        }
+      }
+    }
+  } catch {
+    console.log(ansi.dim("  Could not fetch models. Using default."));
+  }
+
+  // 4. Intensity
+  console.log(ansi.bold("\n  [4/4] Processing Mode:"));
+  console.log(`    ${ansi.dim("[1]")} Low    -- Fast, single-file patches`);
+  console.log(`    ${ansi.dim("[2]")} Medium -- Standard refactoring`);
+  console.log(`    ${ansi.dim("[3]")} High   -- Deep scanning & DevOps`);
+
+  const iMap: Record<string, Intensity> = {
+    "1": "low",
+    "2": "medium",
+    "3": "high",
+  };
+  let intensity: Intensity = config.intensity || "medium";
+  const choice = await ask("  Select mode (1-3): ");
+  if (iMap[choice]) intensity = iMap[choice];
+
+  config.defaultModel = model;
+  config.intensity = intensity;
+  config.provider = provider;
+  saveConfig(config);
+
+  console.log("");
+  console.log(ansi.green("  Setup complete."));
+  console.log(
+    ansi.dim(
+      `  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`
+    )
+  );
+  console.log("");
+
+  return { client, model, intensity, provider };
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
 // ---------------------------------------------------------------------------
 
 async function run(
@@ -1203,177 +1244,167 @@ async function run(
     },
   ];
 
+  const updateSystemPrompt = (): void => {
+    history[0] = {
+      role: "system",
+      content: getSystemPrompt(
+        state.intensity,
+        process.cwd(),
+        state.provider
+      ),
+    };
+  };
+
   while (true) {
-    const input = await askMultiline();
+    const input = await readInput();
     if (!input) continue;
 
-    // -- Exit --
+    // ── Exit ──
     if (input === "exit" || input === "quit") {
-      console.log(c.dim("\n  Goodbye.\n"));
+      console.log(ansi.dim("\n  Goodbye.\n"));
       rl.close();
       process.exit(0);
     }
 
-    // -- /help --
+    // ── /help ──
     if (input === "/help") {
       console.log(
         [
           "",
-          c.bold("  Commands:"),
-          `    ${c.dim("cd <path>")}        Switch directory`,
-          `    ${c.dim("/search <query>")}  Search the web`,
-          `    ${c.dim("/fetch <url>")}     Fetch URL content`,
-          `    ${c.dim("/write <file>")}    Write a file manually`,
-          `    ${c.dim("/settings")}        Configure preferences`,
-          `    ${c.dim("/models")}          Re-select model`,
-          `    ${c.dim("/provider")}        Switch Groq / Cerebras`,
-          `    ${c.dim("/resume")}          Resume last conversation`,
-          `    ${c.dim("/clear")}           Reset conversation`,
-          `    ${c.dim("/compact")}         Trim context`,
-          `    ${c.dim("/cmds")}            List all commands`,
-          `    ${c.dim("/status")}          Show usage stats`,
-          `    ${c.dim("exit")}             Quit`,
-          "",
-          c.dim(
-            "  Auto-search: when a question needs current data,"
-          ),
-          c.dim("  the agent searches the web automatically."),
+          ansi.bold("  Commands:"),
+          `    ${ansi.dim("cd <path>")}        Switch directory`,
+          `    ${ansi.dim("/search <query>")}  Search the web`,
+          `    ${ansi.dim("/fetch <url>")}     Fetch URL content`,
+          `    ${ansi.dim("/write <file>")}    Write a file manually`,
+          `    ${ansi.dim("/settings")}        Configure preferences`,
+          `    ${ansi.dim("/models")}          Re-select model`,
+          `    ${ansi.dim("/provider")}        Switch Groq / Cerebras`,
+          `    ${ansi.dim("/resume")}          Resume last conversation`,
+          `    ${ansi.dim("/clear")}           Reset conversation`,
+          `    ${ansi.dim("/compact")}         Trim context`,
+          `    ${ansi.dim("/cmds")}            List all commands`,
+          `    ${ansi.dim("/status")}          Show usage stats`,
+          `    ${ansi.dim("exit")}             Quit`,
           "",
         ].join("\n")
       );
       continue;
     }
 
-    // -- /clear --
+    // ── /clear ──
     if (input === "/clear") {
       history.length = 1;
-      history[0] = {
-        role: "system",
-        content: getSystemPrompt(
-          state.intensity,
-          process.cwd(),
-          state.provider
-        ),
-      };
-      console.log(c.green("  [OK] Conversation cleared.\n"));
+      updateSystemPrompt();
+      console.log(ansi.green("  Conversation cleared.\n"));
       continue;
     }
 
-    // -- /resume --
+    // ── /resume ──
     if (input === "/resume") {
       const session = loadSession();
       if (!session) {
         console.log(
-          c.yellow("  No saved session found. Start a conversation first.\n")
+          ansi.yellow("  No saved session. Start a conversation first.\n")
         );
         continue;
       }
       history.length = 0;
       for (const msg of session.history) {
-        history.push({
-          role: msg.role as "system" | "user" | "assistant",
-          content: msg.content,
-        });
+        const role = msg.role as Role;
+        history.push({ role, content: msg.content });
       }
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
-        history[0] = {
-          role: "system",
-          content: getSystemPrompt(
-            state.intensity,
-            process.cwd(),
-            state.provider
-          ),
-        };
+        updateSystemPrompt();
       }
-      const msgCount = history.filter(
+      const count = history.filter(
         (m) => m.role === "user" || m.role === "assistant"
       ).length;
       console.log(
-        c.green(
-          `  [OK] Resumed ${msgCount} messages from ${formatSessionAge(session.timestamp)}.\n`
+        ansi.green(
+          `  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`
         )
       );
       console.log(
-        c.dim(
+        ansi.dim(
           `  Model: ${session.model} | Provider: ${PROVIDERS[session.provider || "groq"].name}\n`
         )
       );
       continue;
     }
 
-    // -- /cmds --
+    // ── /cmds ──
     if (input === "/cmds") {
       console.log(
         [
           "",
-          c.bold(c.blue("  Flow Code Commands")),
-          c.dim("  --------------------------------------------"),
+          ansi.bold(ansi.blue("  Flow Code Commands")),
+          ansi.dim("  --------------------------------------------"),
           "",
-          c.bold("  Navigation:"),
-          `    ${c.cyan("cd <path>")}            Switch working directory`,
-          `    ${c.cyan("cd ..")}                Go up one directory`,
-          `    ${c.cyan("cd ~")}                 Go to home directory`,
+          ansi.bold("  Navigation:"),
+          `    ${ansi.cyan("cd <path>")}            Switch working directory`,
+          `    ${ansi.cyan("cd ..")}                Go up one directory`,
+          `    ${ansi.cyan("cd ~")}                 Go to home directory`,
           "",
-          c.bold("  Web & Search:"),
-          `    ${c.cyan("/search <query>")}      Search the web via DuckDuckGo`,
-          `    ${c.cyan("/fetch <url>")}         Fetch and display URL content`,
+          ansi.bold("  Web & Search:"),
+          `    ${ansi.cyan("/search <query>")}      Search the web via DuckDuckGo`,
+          `    ${ansi.cyan("/fetch <url>")}         Fetch and display URL content`,
           "",
-          c.bold("  Files:"),
-          `    ${c.cyan("/write <file>")}        Write a file manually (paste content)`,
-          `    ${c.dim("Auto-write")}             Code blocks with filenames auto-save`,
+          ansi.bold("  Files:"),
+          `    ${ansi.cyan("/write <file>")}        Write a file manually (paste content)`,
+          `    ${ansi.dim("Auto-write")}             Code blocks with filenames auto-save`,
           "",
-          c.bold("  Session Management:"),
-          `    ${c.cyan("/resume")}              Resume last conversation`,
-          `    ${c.cyan("/clear")}               Reset conversation history`,
-          `    ${c.cyan("/compact")}             Trim history to fit context`,
+          ansi.bold("  Session Management:"),
+          `    ${ansi.cyan("/resume")}              Resume last conversation`,
+          `    ${ansi.cyan("/clear")}               Reset conversation history`,
+          `    ${ansi.cyan("/compact")}             Trim history to fit context`,
           "",
-          c.bold("  Configuration:"),
-          `    ${c.cyan("/settings")}            Open interactive settings menu`,
-          `    ${c.cyan("/models")}              Re-select your model`,
-          `    ${c.cyan("/provider")}            Switch between Groq / Cerebras`,
+          ansi.bold("  Configuration:"),
+          `    ${ansi.cyan("/settings")}            Open interactive settings menu`,
+          `    ${ansi.cyan("/models")}              Re-select your model`,
+          `    ${ansi.cyan("/provider")}            Switch between Groq / Cerebras`,
           "",
-          c.bold("  Information:"),
-          `    ${c.cyan("/status")}              Show provider, model, tokens`,
-          `    ${c.cyan("/cmds")}                Show this command list`,
-          `    ${c.cyan("/help")}                Show condensed help`,
+          ansi.bold("  Information:"),
+          `    ${ansi.cyan("/status")}              Show provider, model, tokens`,
+          `    ${ansi.cyan("/cmds")}                Show this command list`,
+          `    ${ansi.cyan("/help")}                Show condensed help`,
           "",
-          c.bold("  Exit:"),
-          `    ${c.cyan("exit")}                 Quit Flow Code`,
-          `    ${c.cyan("quit")}                 Quit Flow Code`,
-          `    ${c.cyan("Ctrl+C")}               Quit Flow Code`,
+          ansi.bold("  Exit:"),
+          `    ${ansi.cyan("exit")}                 Quit Flow Code`,
+          `    ${ansi.cyan("quit")}                 Quit Flow Code`,
+          `    ${ansi.cyan("Ctrl+C")}               Quit Flow Code`,
           "",
-          c.dim("  Multiline: end a line with \\ to continue."),
-          c.dim("  Auto-search: detects when queries need web data."),
+          ansi.dim("  Multiline: end a line with \\ to continue."),
           "",
         ].join("\n")
       );
       continue;
     }
 
-    // -- /compact --
+    // ── /compact ──
     if (input === "/compact") {
       const before = history.length;
       const compacted = trimHistory(history);
       history.length = 0;
       history.push(...compacted);
       console.log(
-        c.green(
-          `  [OK] Compacted: ${before} -> ${history.length} messages.\n`
+        ansi.green(
+          `  Compacted: ${before} -> ${history.length} messages.\n`
         )
       );
       continue;
     }
 
-    // -- /status --
+    // ── /status ──
     if (input === "/status") {
-      const totalUsed = history.reduce((acc, msg) => {
-        return acc + estimateTokens(getMessageContent(msg));
-      }, 0);
+      const totalUsed = history.reduce(
+        (acc, msg) => acc + estimateTokens(getMessageContent(msg)),
+        0
+      );
       console.log(
         [
           "",
-          c.bold("  Session:"),
+          ansi.bold("  Session:"),
           `    Provider:   ${PROVIDERS[state.provider].name}`,
           `    Model:      ${state.model}`,
           `    Intensity:  ${state.intensity.toUpperCase()}`,
@@ -1386,212 +1417,195 @@ async function run(
       continue;
     }
 
-    // -- /models --
+    // ── /models ──
     if (input === "/models") {
       try {
         const res = await state.client.models.list();
         const models = res.data
           .map((m) => m.id)
-          .filter((id) => PROVIDERS[state.provider].models.test(id))
+          .filter((id) => PROVIDERS[state.provider].modelFilter.test(id))
           .sort();
         console.log(
-          c.bold(`\n  ${PROVIDERS[state.provider].name} Models:`)
+          ansi.bold(`\n  ${PROVIDERS[state.provider].name} Models:`)
         );
         models.forEach((m, i) =>
-          console.log(`    ${c.dim(`[${i}]`)} ${m}`)
+          console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
         );
         const choice = await ask(
           `\n  Select (0-${models.length - 1}): `
         );
         const idx = parseInt(choice, 10);
         if (!isNaN(idx) && idx >= 0 && idx < models.length) {
-          const newModel = sanitizeModelId(models[idx]);
-          state.model = newModel;
-          console.log(c.green(`  [OK] ${newModel}\n`));
-          const config = loadConfig();
-          config.defaultModel = newModel;
-          saveConfig(config);
-          history[0] = {
-            role: "system",
-            content: getSystemPrompt(
-              state.intensity,
-              process.cwd(),
-              state.provider
-            ),
-          };
+          state.model = sanitizeModelId(models[idx]);
+          console.log(ansi.green(`  Model: ${state.model}\n`));
+          const cfg = loadConfig();
+          cfg.defaultModel = state.model;
+          saveConfig(cfg);
+          updateSystemPrompt();
         }
       } catch {
-        console.log(c.red("  Could not fetch models."));
+        console.log(ansi.red("  Could not fetch models."));
       }
       continue;
     }
 
-    // -- /provider --
+    // ── /provider ──
     if (input === "/provider") {
-      console.log(c.bold("  Switch provider:"));
-      console.log(`    ${c.dim("[1]")} Groq`);
-      console.log(`    ${c.dim("[2]")} Cerebras`);
-      const pChoice = await ask("  Select (1-2): ");
-      const newProvider: Provider = pChoice === "2" ? "cerebras" : "groq";
+      console.log(ansi.bold("  Switch provider:"));
+      console.log(`    ${ansi.dim("[1]")} Groq`);
+      console.log(`    ${ansi.dim("[2]")} Cerebras`);
+      const p = await ask("  Select (1-2): ");
+      const np: Provider = p === "2" ? "cerebras" : "groq";
 
-      if (newProvider === state.provider) {
+      if (np === state.provider) {
         console.log(
-          c.yellow(
+          ansi.yellow(
             `  Already using ${PROVIDERS[state.provider].name}.\n`
           )
         );
         continue;
       }
 
-      console.log(
-        c.dim(`  Enter ${PROVIDERS[newProvider].name} API Key:`)
-      );
+      console.log(ansi.dim(`  Enter ${PROVIDERS[np].name} API Key:`));
       const key = await ask("  API Key: ");
       if (!key || key.length < 10) {
-        console.log(c.red("  Invalid key. Provider not changed.\n"));
+        console.log(ansi.red("  Invalid key. Provider not changed.\n"));
         continue;
       }
 
-      const newClient = new OpenAI({
-        baseURL: PROVIDERS[newProvider].baseURL,
+      const nc = new OpenAI({
+        baseURL: PROVIDERS[np].baseURL,
         apiKey: key,
       });
 
       try {
-        console.log(
-          c.dim(`  Connecting to ${PROVIDERS[newProvider].name}...`)
-        );
-        await newClient.models.list();
+        console.log(ansi.dim(`  Connecting to ${PROVIDERS[np].name}...`));
+        await nc.models.list();
 
-        state.client = newClient;
-        state.provider = newProvider;
-        state.model = PROVIDERS[newProvider].defaultModel;
+        state.client = nc;
+        state.provider = np;
+        state.model = PROVIDERS[np].defaultModel;
 
-        const config = loadConfig();
-        config.provider = newProvider;
-        config.apiKey = key;
-        config.defaultModel = state.model;
-        saveConfig(config);
+        const cfg = loadConfig();
+        cfg.provider = np;
+        cfg.apiKey = key;
+        cfg.defaultModel = state.model;
+        saveConfig(cfg);
 
-        history[0] = {
-          role: "system",
-          content: getSystemPrompt(
-            state.intensity,
-            process.cwd(),
-            state.provider
-          ),
-        };
+        updateSystemPrompt();
 
         console.log(
-          c.green(
-            `  [OK] Switched to ${PROVIDERS[newProvider].name} | ${state.model}\n`
+          ansi.green(
+            `  Switched to ${PROVIDERS[np].name} | ${state.model}\n`
           )
         );
-        logActivity(`Switched to ${PROVIDERS[newProvider].name}`);
+        logActivity(`Switched to ${PROVIDERS[np].name}`);
       } catch (err: unknown) {
         const msg =
           err instanceof Error ? err.message : "Connection failed";
         console.error(
-          c.red(`  [ERROR] ${PROVIDERS[newProvider].name}: ${msg}\n`)
+          ansi.red(`  ${PROVIDERS[np].name}: ${msg}\n`)
         );
       }
       continue;
     }
 
-    // -- /settings --
+    // ── /settings ──
     if (input === "/settings") {
-      const config = loadConfig();
+      const cfg = loadConfig();
       console.log(
         [
           "",
-          c.bold("  Settings:"),
-          `    ${c.dim("[1]")} Change API Key`,
-          `    ${c.dim("[2]")} Switch Provider (${PROVIDERS[config.provider || "groq"].name})`,
-          `    ${c.dim("[3]")} Change Model (${config.defaultModel || "default"})`,
-          `    ${c.dim("[4]")} Change Intensity (${(config.intensity || "medium").toUpperCase()})`,
-          `    ${c.dim("[5]")} View Config`,
-          `    ${c.dim("[6]")} Reset All`,
+          ansi.bold("  Settings:"),
+          `    ${ansi.dim("[1]")} Change API Key`,
+          `    ${ansi.dim("[2]")} Switch Provider (${PROVIDERS[cfg.provider || "groq"].name})`,
+          `    ${ansi.dim("[3]")} Change Model (${cfg.defaultModel || "default"})`,
+          `    ${ansi.dim("[4]")} Change Intensity (${(cfg.intensity || "medium").toUpperCase()})`,
+          `    ${ansi.dim("[5]")} View Config`,
+          `    ${ansi.dim("[6]")} Reset All`,
           "",
         ].join("\n")
       );
 
-      const setting = await ask("  Select (1-6): ");
+      const sel = await ask("  Select (1-6): ");
 
-      switch (setting) {
+      switch (sel) {
         case "1": {
           const key = await ask("  New API Key: ");
           if (key && key.length > 10) {
-            config.apiKey = key;
-            saveConfig(config);
-            console.log(c.green("  [OK] API key updated.\n"));
+            cfg.apiKey = key;
+            saveConfig(cfg);
+            console.log(ansi.green("  API key updated.\n"));
+          } else {
+            console.log(ansi.yellow("  Key too short. Not saved.\n"));
           }
           break;
         }
         case "2": {
-          console.log(`    ${c.dim("[1]")} Groq`);
-          console.log(`    ${c.dim("[2]")} Cerebras`);
+          console.log(`    ${ansi.dim("[1]")} Groq`);
+          console.log(`    ${ansi.dim("[2]")} Cerebras`);
           const p = await ask("  Select: ");
-          config.provider = p === "2" ? "cerebras" : "groq";
-          config.apiKey = "";
-          config.defaultModel =
-            PROVIDERS[config.provider || "groq"].defaultModel;
-          saveConfig(config);
+          cfg.provider = p === "2" ? "cerebras" : "groq";
+          cfg.apiKey = ""; // force re-entry on restart
+          cfg.defaultModel =
+            PROVIDERS[cfg.provider || "groq"].defaultModel;
+          saveConfig(cfg);
           console.log(
-            c.green(
-              `  [OK] Provider: ${PROVIDERS[config.provider || "groq"].name}. Restart to apply.\n`
+            ansi.green(
+              `  Provider: ${PROVIDERS[cfg.provider || "groq"].name}. Restart to apply.\n`
             )
           );
           break;
         }
         case "3": {
           try {
-            const client = new OpenAI({
-              baseURL: PROVIDERS[config.provider || "groq"].baseURL,
-              apiKey: config.apiKey,
+            const cl = new OpenAI({
+              baseURL: PROVIDERS[cfg.provider || "groq"].baseURL,
+              apiKey: cfg.apiKey,
             });
-            const res = await client.models.list();
+            const res = await cl.models.list();
             const models = res.data
               .map((m) => m.id)
               .filter((id) =>
-                PROVIDERS[config.provider || "groq"].models.test(id)
+                PROVIDERS[cfg.provider || "groq"].modelFilter.test(id)
               )
               .sort();
-            console.log(c.bold("\n  Models:"));
+            console.log(ansi.bold("\n  Models:"));
             models.forEach((m, i) =>
-              console.log(`    ${c.dim(`[${i}]`)} ${m}`)
+              console.log(`    ${ansi.dim(`[${i}]`)} ${m}`)
             );
             const choice = await ask(
               `\n  Select (0-${models.length - 1}): `
             );
             const idx = parseInt(choice, 10);
             if (!isNaN(idx) && idx >= 0 && idx < models.length) {
-              config.defaultModel = models[idx];
-              saveConfig(config);
+              cfg.defaultModel = models[idx];
+              saveConfig(cfg);
               console.log(
-                c.green(`  [OK] Model: ${models[idx]}\n`)
+                ansi.green(`  Model: ${models[idx]}\n`)
               );
             }
           } catch {
-            console.log(c.red("  Could not fetch models."));
+            console.log(ansi.red("  Could not fetch models."));
           }
           break;
         }
         case "4": {
-          console.log(`    ${c.dim("[1]")} Low`);
-          console.log(`    ${c.dim("[2]")} Medium`);
-          console.log(`    ${c.dim("[3]")} High`);
-          const iChoice = await ask("  Select: ");
+          console.log(`    ${ansi.dim("[1]")} Low`);
+          console.log(`    ${ansi.dim("[2]")} Medium`);
+          console.log(`    ${ansi.dim("[3]")} High`);
+          const ic = await ask("  Select: ");
           const map: Record<string, Intensity> = {
             "1": "low",
             "2": "medium",
             "3": "high",
           };
-          if (map[iChoice]) {
-            config.intensity = map[iChoice];
-            saveConfig(config);
+          if (map[ic]) {
+            cfg.intensity = map[ic];
+            saveConfig(cfg);
             console.log(
-              c.green(
-                `  [OK] Intensity: ${config.intensity.toUpperCase()}\n`
+              ansi.green(
+                `  Intensity: ${cfg.intensity.toUpperCase()}\n`
               )
             );
           }
@@ -1599,18 +1613,18 @@ async function run(
         }
         case "5": {
           console.log("");
-          console.log(c.bold("  Current config:"));
+          console.log(ansi.bold("  Current config:"));
           console.log(
-            `    Provider:   ${PROVIDERS[config.provider || "groq"].name}`
+            `    Provider:   ${PROVIDERS[cfg.provider || "groq"].name}`
           );
           console.log(
-            `    Model:      ${config.defaultModel || "default"}`
+            `    Model:      ${cfg.defaultModel || "default"}`
           );
           console.log(
-            `    Intensity:  ${(config.intensity || "medium").toUpperCase()}`
+            `    Intensity:  ${(cfg.intensity || "medium").toUpperCase()}`
           );
           console.log(
-            `    API Key:    ${config.apiKey ? config.apiKey.slice(0, 6) + "..." + config.apiKey.slice(-4) : "not set"}`
+            `    API Key:    ${cfg.apiKey ? cfg.apiKey.slice(0, 6) + "..." + cfg.apiKey.slice(-4) : "not set"}`
           );
           console.log(`    Config:     ${CONFIG_PATH}`);
           console.log("");
@@ -1618,16 +1632,16 @@ async function run(
         }
         case "6": {
           const confirm = await ask(
-            c.yellow("  Are you sure? (yes/no): ")
+            ansi.yellow("  Are you sure? (yes/no): ")
           );
           if (confirm.toLowerCase() === "yes") {
             try {
               fs.unlinkSync(CONFIG_PATH);
             } catch {
-              /* ok */
+              // ok
             }
             console.log(
-              c.green("  [OK] Config reset. Restart to apply.\n")
+              ansi.green("  Config reset. Restart to apply.\n")
             );
           }
           break;
@@ -1636,43 +1650,45 @@ async function run(
       continue;
     }
 
-    // -- /search --
+    // ── /search ──
     if (input.startsWith("/search ")) {
       const query = input.slice(8).trim();
       if (!query) {
-        console.log(c.yellow("  Usage: /search <query>"));
+        console.log(ansi.yellow("  Usage: /search <query>"));
         continue;
       }
-      console.log(c.dim(`  Searching: ${query}...`));
+      console.log(ansi.dim(`  Searching: ${query}...`));
       const results = await searchWeb(query);
       console.log(formatSearchResults(results, query));
 
-      const resultText = results
-        .map(
-          (r, i) => `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`
-        )
-        .join("\n\n");
-
-      history.push({
-        role: "user",
-        content: `Web search results for "${query}":\n\n${resultText}`,
-      });
+      if (results.length > 0) {
+        const resultText = results
+          .map(
+            (r, i) =>
+              `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`
+          )
+          .join("\n\n");
+        history.push({
+          role: "user",
+          content: `Web search results for "${query}":\n\n${resultText}`,
+        });
+      }
       continue;
     }
 
-    // -- /fetch --
+    // ── /fetch ──
     if (input.startsWith("/fetch ")) {
       const url = input.slice(7).trim();
       if (!url || !url.startsWith("http")) {
-        console.log(c.yellow("  Usage: /fetch <https://url>"));
+        console.log(ansi.yellow("  Usage: /fetch <https://url>"));
         continue;
       }
-      console.log(c.dim(`  Fetching: ${url}...`));
+      console.log(ansi.dim(`  Fetching: ${url}...`));
       const content = await fetchUrlContent(url);
-      console.log(`\n${c.dim(content.slice(0, 3000))}`);
+      console.log(`\n${ansi.dim(content.slice(0, 3000))}`);
       if (content.length > 3000) {
         console.log(
-          c.dim(`\n  ... (${content.length} chars total)`)
+          ansi.dim(`\n  ... (${content.length} chars total)`)
         );
       }
       console.log("");
@@ -1684,75 +1700,76 @@ async function run(
       continue;
     }
 
-    // -- /write <filepath> --
+    // ── /write ──
     if (input.startsWith("/write ")) {
-      const filepath = input
+      const rawPath = input
         .slice(7)
         .trim()
         .replace(/^['"]|['"]$/g, "");
-      if (!filepath) {
-        console.log(c.yellow("  Usage: /write <filepath>"));
+      if (!rawPath) {
+        console.log(ansi.yellow("  Usage: /write <filepath>"));
         console.log(
-          c.dim(
-            "  Then paste or type content, end with a line containing only '---'"
+          ansi.dim(
+            "  Paste content, end with a line containing only '---'"
           )
         );
         continue;
       }
-      console.log(c.dim(`  Writing to: ${filepath}`));
+      const filepath = safePath(path.resolve(process.cwd(), rawPath));
+      // Security: only write inside cwd
+      if (!isPathInside(filepath, process.cwd()) && filepath !== path.join(process.cwd(), path.basename(filepath))) {
+        console.log(ansi.red("  Path must be inside current directory."));
+        continue;
+      }
+      console.log(ansi.dim(`  Writing to: ${path.relative(process.cwd(), filepath)}`));
       console.log(
-        c.dim("  Paste/type content. End with a line containing only '---':")
+        ansi.dim("  Paste/type content. End with '---':")
       );
       const lines: string[] = [];
       while (true) {
-        const line = await ask(c.dim("  | "));
+        const line = await ask(ansi.dim("  | "));
         if (line.trim() === "---") break;
         lines.push(line);
       }
       const content = lines.join("\n");
       if (content.length === 0) {
-        console.log(c.yellow("  Empty content. File not written."));
+        console.log(ansi.yellow("  Empty. File not written."));
         continue;
       }
-      const target = path.resolve(process.cwd(), filepath);
       try {
-        const dir = path.dirname(target);
+        const dir = path.dirname(filepath);
         if (!fs.existsSync(dir)) {
           fs.mkdirSync(dir, { recursive: true });
         }
-        fs.writeFileSync(target, content, "utf-8");
-        const rel = path.relative(process.cwd(), target);
+        fs.writeFileSync(filepath, content, "utf-8");
+        const rel = path.relative(process.cwd(), filepath);
         console.log(
-          c.green(
-            `  [OK] Created: ${rel} (${content.length} chars)\n`
-          )
+          ansi.green(`  Created: ${rel} (${content.length} chars)\n`)
         );
-        logActivity(`Created: ${path.basename(target)}`);
+        logActivity(`Created: ${path.basename(filepath)}`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Write failed";
-        console.error(c.red(`  [ERROR] ${msg}\n`));
+        console.error(ansi.red(`  ${msg}\n`));
       }
       continue;
     }
 
-    // -- Native cd --
+    // ── cd ──
     if (input === "cd" || input === "cd ~" || input === "cd $HOME") {
       const home = os.homedir();
       try {
         process.chdir(home);
-        console.log(c.green(`  [OK] ${home}\n`));
+        console.log(ansi.green(`  ${home}\n`));
         const tree = scanDirectory(home, 3);
         if (tree) {
-          console.log(c.dim("  Directory:"));
-          console.log(c.dim(tree) + "\n");
+          console.log(ansi.dim("  Directory:"));
+          console.log(ansi.dim(tree) + "\n");
         }
-        history[0] = {
-          role: "system",
-          content: getSystemPrompt(state.intensity, home, state.provider),
-        };
+        updateSystemPrompt();
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(c.red(`  [ERROR] ${msg}`));
+        console.error(
+          ansi.red(`  ${err instanceof Error ? err.message : String(err)}`)
+        );
       }
       continue;
     }
@@ -1763,32 +1780,25 @@ async function run(
         .replace(/^['"]|['"]$/g, "")
         .trim();
       if (!raw || raw.includes("\0")) {
-        console.error(c.red("  [ERROR] Invalid path."));
+        console.error(ansi.red("  Invalid path."));
         continue;
       }
       try {
         const target = path.resolve(raw);
         process.chdir(target);
-        const newCwd = process.cwd();
-        console.log(c.green(`  [OK] ${newCwd}\n`));
-        const tree = scanDirectory(newCwd, 3);
+        const cwd = process.cwd();
+        console.log(ansi.green(`  ${cwd}\n`));
+        const tree = scanDirectory(cwd, 3);
         if (tree) {
-          console.log(c.dim("  Directory:"));
-          console.log(c.dim(tree) + "\n");
+          console.log(ansi.dim("  Directory:"));
+          console.log(ansi.dim(tree) + "\n");
         }
-        history[0] = {
-          role: "system",
-          content: getSystemPrompt(
-            state.intensity,
-            newCwd,
-            state.provider
-          ),
-        };
+        updateSystemPrompt();
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(c.red(`  [ERROR] ${msg}`));
+        console.error(ansi.red(`  ${msg}`));
         console.log(
-          c.dim(
+          ansi.dim(
             "  Tip: use full paths like C:\\Users\\name\\project or /home/user/project"
           )
         );
@@ -1796,37 +1806,25 @@ async function run(
       continue;
     }
 
-    // -- Update system prompt --
-    history[0] = {
-      role: "system",
-      content: getSystemPrompt(
-        state.intensity,
-        process.cwd(),
-        state.provider
-      ),
-    };
+    // ── Send to LLM ──
+    updateSystemPrompt();
 
-    // -- Auto-search --
+    // Auto-search
     let finalInput = input;
     if (needsWebSearch(input)) {
-      console.log(c.dim("  Auto-searching for current data..."));
-      const searchResults = await searchWeb(input, 3);
-      if (searchResults.length > 0) {
-        const searchContext = searchResults
+      console.log(ansi.dim("  Searching the web..."));
+      const sr = await searchWeb(input, 3);
+      if (sr.length > 0) {
+        const ctx = sr
           .map((r) => `- ${r.title}: ${r.snippet} (${r.url})`)
           .join("\n");
-        finalInput = `${input}\n\n[Web search results -- use this context to answer accurately:]\n${searchContext}`;
+        finalInput = `${input}\n\n[Web search results:]\n${ctx}`;
         logActivity(`Searched: ${input.slice(0, 50)}`);
       }
     }
 
-    // Add user message
     history.push({ role: "user", content: finalInput });
-
-    // Trim
     const trimmed = trimHistory(history);
-
-    // Temperature
     const temp =
       state.intensity === "low"
         ? 0.0
@@ -1834,9 +1832,8 @@ async function run(
           ? 0.2
           : 0.4;
 
-    // Stream response
     try {
-      process.stdout.write(c.dim("  Thinking...\r"));
+      showThinking();
       const { content: reply, usage } = await streamResponse(
         state.client,
         state.model,
@@ -1845,7 +1842,7 @@ async function run(
       );
 
       if (!reply) {
-        console.log(c.red("  No response."));
+        console.log(ansi.red("  No response."));
         history.pop();
         continue;
       }
@@ -1855,69 +1852,66 @@ async function run(
 
       history.push({ role: "assistant", content: reply });
 
-      // Auto-write files from code blocks
+      // Auto-write files
       const files = extractFilesFromResponse(reply, process.cwd());
       if (files.length > 0) {
-        console.log(c.bold("  Auto-writing detected files:"));
+        console.log(ansi.bold("  Detected files:"));
         const wrote = writeFiles(files);
-        if (wrote) {
-          logActivity(`Auto-wrote ${files.length} file(s)`);
-        }
+        if (wrote) logActivity(`Auto-wrote ${files.length} file(s)`);
         console.log("");
       }
 
-      // Execute bash blocks
+      // Auto-execute bash
       const blocks = extractBashBlocks(reply);
       const cwd = process.cwd();
-
       for (const block of blocks) {
-        console.log(c.dim(`  > ${block}`));
-        const result = await execShellStreaming(block, cwd);
+        console.log(ansi.dim(`  > ${block}`));
+        const result = await execShell(block, cwd);
         if (result.ok) {
-          console.log(c.green("  [OK] Done.\n"));
+          console.log(ansi.green("  Done.\n"));
           logActivity(`Ran: ${block.slice(0, 60)}`);
         } else {
-          console.log(c.red("  [FAIL] Failed.\n"));
+          console.log(ansi.red("  Failed.\n"));
           logActivity(`Failed: ${block.slice(0, 60)}`);
         }
         history.push({
           role: "user",
-          content: `Terminal output:\n${result.output.slice(0, 2000)}`,
+          content: `Terminal output:\n${result.output}`,
         });
       }
 
-      // Auto-save session for /resume
-      saveSession(history, state.model, state.provider, state.intensity);
+      saveSession(
+        history,
+        state.model,
+        state.provider,
+        state.intensity
+      );
     } catch (err: unknown) {
-      process.stdout.write(" ".repeat(30) + "\r");
+      clearLine();
       const msg = err instanceof Error ? err.message : String(err);
 
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
         console.error(
-          c.red(
-            `  [ERROR] Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`
+          ansi.red(
+            `  Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`
           )
         );
       } else if (msg.includes("404") || msg.includes("does not exist")) {
         console.error(
-          c.red(`  [ERROR] Model '${state.model}' not found.`)
+          ansi.red(`  Model '${state.model}' not found.`)
         );
-        console.log(c.dim("  Type /models to re-select a valid model."));
+        console.log(ansi.dim("  Type /models to re-select."));
         state.model = PROVIDERS[state.provider].defaultModel;
-        const config = loadConfig();
-        config.defaultModel = state.model;
-        saveConfig(config);
-        console.log(c.green(`  [OK] Default: ${state.model}\n`));
+        const cfg = loadConfig();
+        cfg.defaultModel = state.model;
+        saveConfig(cfg);
+        console.log(ansi.green(`  Default: ${state.model}\n`));
       } else if (msg.includes("429")) {
-        console.error(
-          c.yellow("  Rate limited. Wait a moment.")
-        );
+        console.error(ansi.yellow("  Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
-        console.error(
-          c.yellow("  Model overloaded. Try again.")
-        );
+        console.error(ansi.yellow("  Model overloaded. Try again."));
       } else {
-        console.error(c.red(`  [ERROR] ${msg}`));
+        console.error(ansi.red(`  ${msg}`));
       }
       history.pop();
     }
@@ -1932,7 +1926,7 @@ function main(): void {
   rl.on("close", () => process.exit(0));
 
   process.on("SIGINT", () => {
-    console.log(c.dim("\n\n  Goodbye.\n"));
+    console.log(ansi.dim("\n\n  Goodbye.\n"));
     rl.close();
     process.exit(0);
   });
@@ -1943,11 +1937,11 @@ function main(): void {
   });
 
   process.on("unhandledRejection", (err) => {
-    console.error(c.red(`\n  [UNHANDLED] ${err}`));
+    console.error(ansi.red(`\n  Unhandled: ${err}`));
   });
 
   process.on("uncaughtException", (err) => {
-    console.error(c.red(`\n  [UNCAUGHT] ${err.message}`));
+    console.error(ansi.red(`\n  Uncaught: ${err.message}`));
     process.exit(1);
   });
 
@@ -1955,9 +1949,11 @@ function main(): void {
 
   setup()
     .then(async ({ client, model, intensity, provider }) => {
-      console.log(c.dim(`  Working directory: ${process.cwd()}`));
+      console.log(
+        ansi.dim(`  Working directory: ${process.cwd()}`)
+      );
       const dirInput = await ask(
-        c.bold("  Project directory (Enter to skip): ")
+        ansi.bold("  Project directory (Enter to skip): ")
       );
       if (dirInput.trim()) {
         const cleaned = dirInput
@@ -1967,11 +1963,11 @@ function main(): void {
         try {
           process.chdir(target);
           console.log(
-            c.green(`  Switched to: ${process.cwd()}\n`)
+            ansi.green(`  Switched to: ${process.cwd()}\n`)
           );
         } catch {
           console.log(
-            c.yellow(
+            ansi.yellow(
               `  Could not open '${target}'. Using current.\n`
             )
           );
@@ -1985,16 +1981,14 @@ function main(): void {
         const session = loadSession();
         if (session) {
           console.log(
-            c.dim(
-              `  Last session: ${formatSessionAge(session.timestamp)} -- type /resume to continue`
+            ansi.dim(
+              `  Last session: ${timeAgo(session.timestamp)} -- type /resume to continue`
             )
           );
         }
       }
       console.log(
-        c.green(
-          "  Ready! Type /cmds for commands, /help for help.\n"
-        )
+        ansi.green("  Ready! Type /cmds for commands.\n")
       );
 
       logActivity("Started session");
@@ -2002,7 +1996,7 @@ function main(): void {
     })
     .catch((err) => {
       console.error(
-        c.red(`\n  [FATAL] ${err.message || err}`)
+        ansi.red(`\n  Fatal: ${err.message || err}`)
       );
       process.exit(1);
     });
