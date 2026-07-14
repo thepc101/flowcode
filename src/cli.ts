@@ -24,6 +24,10 @@ const MAX_SHELL_OUTPUT = 4000;
 const MAX_WEB_CONTENT = 12000;
 const MAX_FILE_READ = 50_000;
 const MAX_TOOL_ROUNDS = 25;
+const COST_PER_TOKEN = 0.000001;
+const MIN_API_KEY_LENGTH = 10;
+
+const BLOCKED_COMMANDS = /\b(rm\s+-rf\s+\/|mkfs|dd\s+if=|:(){ :\|:& };:|chmod\s+-R\s+777\s+\/|wget.*\|\s*sh|curl.*\|\s*sh|sudo\s+rm|shutdown|reboot|halt|init\s+0|killall|pkill\s+-9\s+-u)\b/;
 
 // ANSI
 const R = "\x1b[0m";
@@ -169,7 +173,7 @@ function safePath(p: string): string {
 
 function isPathInside(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
-  return rel !== "" && !rel.startsWith("..");
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 function renderUsageBar(used: number, total: number): string {
@@ -303,7 +307,31 @@ function loadSession(): SessionData | null {
 }
 
 function hasSavedSession(): boolean {
-  return loadSession() !== null;
+  try {
+    return fs.existsSync(SESSION_PATH);
+  } catch {
+    return false;
+  }
+}
+
+function restoreSession(history: Message[]): { count: number; cwd: string; timestamp: number } | null {
+  const session = loadSession();
+  if (!session) return null;
+  history.length = 0;
+  for (const msg of session.history) {
+    const restored: any = { role: msg.role, content: msg.content || "" };
+    if (msg.tool_calls) restored.tool_calls = msg.tool_calls;
+    if (msg.tool_call_id) restored.tool_call_id = msg.tool_call_id;
+    history.push(restored);
+  }
+  if (session.cwd && fs.existsSync(session.cwd)) {
+    process.chdir(session.cwd);
+  }
+  return {
+    count: history.filter((m) => m.role === "user" || m.role === "assistant").length,
+    cwd: process.cwd(),
+    timestamp: session.timestamp,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +715,7 @@ async function execToolAsync(
       if (!fs.existsSync(fp)) {
         return { tool_call_id: toolCallId, output: `File not found: ${args.path}`, error: true };
       }
-      if (!isPathInside(fp, cwd) && !fp.startsWith(cwd)) {
+      if (!isPathInside(fp, cwd)) {
         return { tool_call_id: toolCallId, output: "Access denied: path outside workspace", error: true };
       }
       try {
@@ -743,11 +771,17 @@ async function execToolAsync(
         if (!content.includes(oldText)) {
           return { tool_call_id: toolCallId, output: "Error: old_text not found. Use read_file first.", error: true };
         }
-        content = content.replace(oldText, newText);
+        const matchCount = content.split(oldText).length - 1;
+        if (matchCount > 1) {
+          content = content.split(oldText).join(newText);
+        } else {
+          content = content.replace(oldText, newText);
+        }
         fs.writeFileSync(fp, content, "utf-8");
         const rel = path.relative(cwd, fp);
         logActivity(`Edited: ${rel}`);
-        return { tool_call_id: toolCallId, output: `File edited: ${rel}` };
+        const extra = matchCount > 1 ? ` (${matchCount} occurrences replaced)` : "";
+        return { tool_call_id: toolCallId, output: `File edited: ${rel}${extra}` };
       } catch (err: unknown) {
         return { tool_call_id: toolCallId, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
       }
@@ -758,6 +792,9 @@ async function execToolAsync(
       showTool("run_command", cmd);
       if (!cmd) {
         return { tool_call_id: toolCallId, output: "Error: command is empty", error: true };
+      }
+      if (BLOCKED_COMMANDS.test(cmd)) {
+        return { tool_call_id: toolCallId, output: "Error: command blocked for safety. This command is destructive.", error: true };
       }
       return new Promise((resolve) => {
         let stdout = "";
@@ -809,6 +846,9 @@ async function execToolAsync(
       if (!fs.existsSync(dir)) {
         return { tool_call_id: toolCallId, output: `Directory not found: ${args.path}`, error: true };
       }
+      if (!isPathInside(dir, cwd)) {
+        return { tool_call_id: toolCallId, output: "Access denied: path outside workspace", error: true };
+      }
       const tree = scanDirectory(dir, depth);
       return { tool_call_id: toolCallId, output: tree || "(empty directory)" };
     }
@@ -830,6 +870,18 @@ async function execToolAsync(
     case "fetch_url": {
       const url = String(args.url || "");
       showTool("fetch_url", url);
+      if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        return { tool_call_id: toolCallId, output: "Error: URL must start with http:// or https://", error: true };
+      }
+      try {
+        const parsed = new URL(url);
+        const blocked = ["169.254.169.254", "127.0.0.1", "localhost", "0.0.0.0"];
+        if (blocked.includes(parsed.hostname)) {
+          return { tool_call_id: toolCallId, output: "Error: URL blocked (private/internal address)", error: true };
+        }
+      } catch {
+        return { tool_call_id: toolCallId, output: "Error: invalid URL", error: true };
+      }
       const content = await fetchUrlContent(url);
       logActivity(`Fetched: ${truncate(url, 60)}`);
       return { tool_call_id: toolCallId, output: content };
@@ -1000,30 +1052,24 @@ function getSystemPrompt(
 function trimHistory(history: Message[]): Message[] {
   if (history.length === 0) return [];
 
-  const result: Message[] = [];
-
   // Always include system prompt
   let sysIdx = -1;
-  if (history[0].role === "system") {
-    result.push(history[0]);
-    sysIdx = 0;
-  }
+  const systemMsg = history[0].role === "system" ? history[0] : null;
+  if (systemMsg) sysIdx = 0;
 
-  // Walk backwards, keeping assistant+tool pairs intact
-  let total = sysIdx >= 0 ? estimateTokens(getMessageContent(history[0])) : 0;
+  // Collect messages from the end, keeping tool pairs intact
+  const collected: Message[] = [];
+  let total = 0;
   let i = history.length - 1;
 
   while (i > sysIdx) {
     const msg = history[i];
 
-    // If this is a tool message, we need to also include all preceding tool messages
-    // and the assistant message that triggered them
     if (msg.role === "tool") {
-      // Walk backwards to find the assistant message with tool_calls
+      // Walk back to find the assistant with tool_calls
       let j = i;
       while (j > sysIdx && history[j].role === "tool") j--;
       // j is now the assistant message (or sysIdx)
-      // Include assistant + all tool messages as a group
       const group: Message[] = [];
       for (let k = j; k <= i; k++) {
         group.push(history[k]);
@@ -1031,13 +1077,15 @@ function trimHistory(history: Message[]): Message[] {
       const groupTokens = group.reduce((sum, m) => sum + estimateTokens(getMessageContent(m)), 0);
       if (total + groupTokens > MAX_HISTORY_TOKENS) break;
       total += groupTokens;
-      for (const m of group) result.splice(1, 0, m);
+      // Add group in forward order (collected is being built reversed)
+      for (let k = group.length - 1; k >= 0; k--) {
+        collected.push(group[k]);
+      }
       i = j - 1;
       continue;
     }
 
-    // If this is an assistant message with tool_calls, skip it
-    // (its tool responses should have been handled above)
+    // Skip assistant messages with tool_calls (handled above with their tools)
     if ((msg as any).tool_calls && (msg as any).tool_calls.length > 0) {
       i--;
       continue;
@@ -1046,10 +1094,16 @@ function trimHistory(history: Message[]): Message[] {
     const tokens = estimateTokens(getMessageContent(msg));
     if (total + tokens > MAX_HISTORY_TOKENS) break;
     total += tokens;
-    result.splice(1, 0, msg);
+    collected.push(msg);
     i--;
   }
 
+  // collected is in reverse chronological order; reverse to restore order
+  collected.reverse();
+
+  const result: Message[] = [];
+  if (systemMsg) result.push(systemMsg);
+  result.push(...collected);
   return result;
 }
 
@@ -1126,21 +1180,23 @@ async function streamWithTools(
   let rounds = 0;
   let totalUsage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
+  // Work on a copy to avoid mutating caller's array
+  const apiMessages: Message[] = [...messages];
+
   // Sanitize: ensure every tool message has a preceding assistant with matching tool_calls
   const sanitized: Message[] = [];
-  for (const m of messages) {
+  for (const m of apiMessages) {
     if (m.role === "tool") {
       const tm = m as any;
       if (!tm.tool_call_id) continue;
-      // Verify the preceding message is an assistant with tool_calls
       if (sanitized.length === 0 || sanitized[sanitized.length - 1].role !== "assistant") continue;
       const prev = sanitized[sanitized.length - 1] as any;
       if (!prev.tool_calls || !prev.tool_calls.some((tc: any) => tc.id === tm.tool_call_id)) continue;
     }
     sanitized.push(m);
   }
-  messages.length = 0;
-  sanitized.forEach((m) => messages.push(m));
+  apiMessages.length = 0;
+  sanitized.forEach((m) => apiMessages.push(m));
 
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
@@ -1151,7 +1207,7 @@ async function streamWithTools(
     try {
       response = await client.chat.completions.create({
         model,
-        messages,
+        messages: apiMessages,
         temperature,
         top_p: 0.95,
         max_tokens: MAX_RESPONSE_TOKENS,
@@ -1165,13 +1221,11 @@ async function streamWithTools(
     }
     clearThinking();
 
-    // Track usage
+    // Accumulate usage across rounds
     if (response.usage) {
-      totalUsage = {
-        promptTokens: response.usage.prompt_tokens,
-        completionTokens: response.usage.completion_tokens,
-        totalTokens: response.usage.total_tokens,
-      };
+      totalUsage.promptTokens += response.usage.prompt_tokens;
+      totalUsage.completionTokens += response.usage.completion_tokens;
+      totalUsage.totalTokens += response.usage.total_tokens;
     }
 
     const choice = response.choices[0];
@@ -1187,7 +1241,7 @@ async function streamWithTools(
     }
 
     // Process tool calls
-    messages.push(msg as Message);
+    apiMessages.push(msg as Message);
     history.push(msg as Message);
 
     for (const tc of msg.tool_calls) {
@@ -1206,7 +1260,7 @@ async function streamWithTools(
         tool_call_id: tc.id,
         content: result.error ? `ERROR: ${result.output}` : result.output,
       };
-      messages.push(toolMsg);
+      apiMessages.push(toolMsg);
       history.push(toolMsg);
     }
   }
@@ -1453,24 +1507,11 @@ async function run(
 
   // Restore session if resuming
   if (resume) {
-    const session = loadSession();
-    if (session) {
-      history.length = 0;
-      for (const msg of session.history) {
-        const restored: any = { role: msg.role, content: msg.content || "" };
-        if (msg.tool_calls) restored.tool_calls = msg.tool_calls;
-        if (msg.tool_call_id) restored.tool_call_id = msg.tool_call_id;
-        history.push(restored);
-      }
-      if (session.cwd && fs.existsSync(session.cwd)) {
-        process.chdir(session.cwd);
-        updateSystem();
-      }
-      const count = history.filter(
-        (m) => m.role === "user" || m.role === "assistant"
-      ).length;
-      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.`));
-      console.log(a.dim(`  Directory: ${process.cwd()}\n`));
+    const result = restoreSession(history);
+    if (result) {
+      updateSystem();
+      console.log(a.green(`  Resumed ${result.count} messages from ${timeAgo(result.timestamp)}.`));
+      console.log(a.dim(`  Directory: ${result.cwd}\n`));
     }
   }
 
@@ -1486,26 +1527,27 @@ async function run(
     }
 
     // ── /help ──
-    if (input === "/help") {
+    if (input === "/help" || input === "/cmds") {
       console.log(
         [
           "",
-          a.bold("  Commands:"),
-          `    ${a.dim("cd <path>")}        Switch directory`,
-          `    ${a.dim("/search <query>")}  Search the web`,
-          `    ${a.dim("/fetch <url>")}     Fetch URL content`,
-          `    ${a.dim("/settings")}        Configure preferences`,
-          `    ${a.dim("/models")}          Re-select model`,
-          `    ${a.dim("/provider")}        Switch Groq / Cerebras`,
-          `    ${a.dim("/resume")}          Resume last conversation`,
-          `    ${a.dim("/clear")}           Reset conversation`,
-          `    ${a.dim("/compact")}         Trim context`,
-          `    ${a.dim("/cmds")}            List all commands`,
-          `    ${a.dim("/status")}          Show usage stats`,
-          `    ${a.dim("exit")}             Quit`,
+          a.bold(a.cyan("  Flow Code Commands")),
+          a.dim("  " + "-".repeat(40)),
           "",
-          a.dim("  The agent has tools: read, write, edit, run, list, search, fetch."),
-          a.dim("  It will autonomously use them to complete your task."),
+          `  ${a.cyan("cd <path>")}            Switch directory`,
+          `  ${a.cyan("/search <query>")}      Search the web`,
+          `  ${a.cyan("/fetch <url>")}         Fetch URL content`,
+          `  ${a.cyan("/resume")}              Resume last conversation`,
+          `  ${a.cyan("/clear")}               Reset conversation`,
+          `  ${a.cyan("/compact")}             Trim context window`,
+          `  ${a.cyan("/models")}              Re-select model`,
+          `  ${a.cyan("/provider")}            Switch Groq / Cerebras`,
+          `  ${a.cyan("/settings")}            Configure preferences`,
+          `  ${a.cyan("/status")}              Show usage stats`,
+          `  ${a.cyan("exit")}                 Quit`,
+          "",
+          a.dim("  The agent uses tools autonomously to complete tasks."),
+          a.dim("  Multiline: end a line with \\ to continue."),
           "",
         ].join("\n")
       );
@@ -1522,65 +1564,14 @@ async function run(
 
     // ── /resume ──
     if (input === "/resume") {
-      const session = loadSession();
-      if (!session) {
+      const result = restoreSession(history);
+      if (!result) {
         console.log(a.yellow("  No saved session.\n"));
         continue;
       }
-      history.length = 0;
-      for (const msg of session.history) {
-        const restored: any = { role: msg.role, content: msg.content || "" };
-        if (msg.tool_calls) restored.tool_calls = msg.tool_calls;
-        if (msg.tool_call_id) restored.tool_call_id = msg.tool_call_id;
-        history.push(restored);
-      }
-      if (session.cwd && fs.existsSync(session.cwd)) {
-        process.chdir(session.cwd);
-        updateSystem();
-      }
-      const count = history.filter((m) => m.role === "user" || m.role === "assistant").length;
-      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.`));
-      console.log(a.dim(`  Directory: ${process.cwd()}\n`));
-      continue;
-    }
-
-    // ── /cmds ──
-    if (input === "/cmds") {
-      console.log(
-        [
-          "",
-          a.bold(a.cyan("  Flow Code Commands")),
-          a.dim("  --------------------------------------------"),
-          "",
-          a.bold("  Navigation:"),
-          `    ${a.cyan("cd <path>")}            Switch working directory`,
-          `    ${a.cyan("cd ..")}                Go up one directory`,
-          `    ${a.cyan("cd ~")}                 Go to home directory`,
-          "",
-          a.bold("  Web & Search:"),
-          `    ${a.cyan("/search <query>")}      Search the web (also auto-detected)`,
-          `    ${a.cyan("/fetch <url>")}         Fetch and read URL content`,
-          "",
-          a.bold("  Session:"),
-          `    ${a.cyan("/resume")}              Resume last conversation`,
-          `    ${a.cyan("/clear")}               Reset conversation history`,
-          `    ${a.cyan("/compact")}             Trim history to fit context`,
-          "",
-          a.bold("  Configuration:"),
-          `    ${a.cyan("/settings")}            Open settings menu`,
-          `    ${a.cyan("/models")}              Re-select your model`,
-          `    ${a.cyan("/provider")}            Switch Groq / Cerebras`,
-          "",
-          a.bold("  Info:"),
-          `    ${a.cyan("/status")}              Show provider, model, tokens`,
-          `    ${a.cyan("/cmds")}                Show this list`,
-          `    ${a.cyan("/help")}                Condensed help`,
-          `    ${a.cyan("exit")}                 Quit`,
-          "",
-          a.dim("  Multiline: end a line with \\ to continue."),
-          "",
-        ].join("\n")
-      );
+      updateSystem();
+      console.log(a.green(`  Resumed ${result.count} messages from ${timeAgo(result.timestamp)}.`));
+      console.log(a.dim(`  Directory: ${result.cwd}\n`));
       continue;
     }
 
@@ -1655,7 +1646,7 @@ async function run(
       }
       console.log(a.dim(`  Enter ${PROVIDERS[np].name} API Key:`));
       const key = await ask("  API Key: ");
-      if (!key || key.length < 10) {
+      if (!key || key.length < MIN_API_KEY_LENGTH) {
         console.log(a.red("  Invalid key.\n"));
         continue;
       }
@@ -1700,12 +1691,12 @@ async function run(
       switch (sel) {
         case "1": {
           const key = await ask("  New API Key: ");
-          if (key && key.length > 10) {
+          if (key && key.length >= MIN_API_KEY_LENGTH) {
             cfg.apiKey = key;
             saveConfig(cfg);
             console.log(a.green("  API key updated.\n"));
           } else {
-            console.log(a.yellow("  Key too short.\n"));
+            console.log(a.yellow(`  Key too short (min ${MIN_API_KEY_LENGTH} chars).\n`));
           }
           break;
         }
@@ -1764,7 +1755,7 @@ async function run(
           console.log(`    Provider:   ${PROVIDERS[cfg.provider || "groq"].name}`);
           console.log(`    Model:      ${cfg.defaultModel || "default"}`);
           console.log(`    Intensity:  ${(cfg.intensity || "medium").toUpperCase()}`);
-          console.log(`    API Key:    ${cfg.apiKey ? cfg.apiKey.slice(0, 6) + "..." + cfg.apiKey.slice(-4) : "not set"}`);
+          console.log(`    API Key:    ${cfg.apiKey ? cfg.apiKey.slice(0, 3) + "..." + cfg.apiKey.slice(-2) : "not set"}`);
           console.log(`    Config:     ${CONFIG_PATH}`);
           console.log("");
           break;
@@ -1841,11 +1832,18 @@ async function run(
       continue;
     }
 
+    // ── Unknown command ──
+    if (input.startsWith("/")) {
+      console.log(a.yellow(`  Unknown command: ${input.split(" ")[0]}. Type /help for commands.\n`));
+      continue;
+    }
+
     // ── Send to agent (with tool loop) ──
     updateSystem();
 
     history.push({ role: "user", content: input });
     const trimmed = trimHistory(history);
+    const historyLenBefore = history.length;
     const temp =
       state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.1 : 0.2;
 
@@ -1861,8 +1859,7 @@ async function run(
       // Track session usage
       if (roundUsage.totalTokens > 0) {
         usage.totalTokens += roundUsage.totalTokens;
-        // Rough cost estimate for Groq free tier
-        usage.totalCost += roundUsage.totalTokens * 0.000001;
+        usage.totalCost += roundUsage.totalTokens * COST_PER_TOKEN;
         printUsage(roundUsage, history);
       }
 
@@ -1873,9 +1870,11 @@ async function run(
       saveSession(history, state.model, state.provider, state.intensity);
     } catch (err: unknown) {
       clearThinking();
+      // Roll back history to before the tool loop
+      history.length = historyLenBefore;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
-        console.error(a.red(`  Invalid API key for ${PROVIDERS[state.provider].name}. Delete ~/.flow-code-config and restart.`));
+        console.error(a.red(`  Invalid API key for ${PROVIDERS[state.provider].name}. Run /settings to update.`));
       } else if (msg.includes("404") || msg.includes("does not exist")) {
         console.error(a.red(`  Model '${state.model}' not found.`));
         console.log(a.dim("  Type /models to re-select."));
@@ -1890,7 +1889,6 @@ async function run(
       } else {
         console.error(a.red(`  ${msg}`));
       }
-      history.pop();
     }
   }
 }
@@ -1949,13 +1947,7 @@ function main(): void {
       const usage = { totalTokens: 0, totalCost: 0 };
       printDashboard(config, usage);
 
-      if (resumedSession) {
-        return run(client, model, intensity, provider, true);
-      }
-
-      console.log(a.green("  Ready! Describe what you want to build.\n"));
-      logActivity("Started session");
-      return run(client, model, intensity, provider, false);
+      return run(client, model, intensity, provider, resumedSession);
     })
     .catch((err) => {
       console.error(a.red(`\n  Fatal: ${err.message || err}`));
