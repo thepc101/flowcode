@@ -978,9 +978,10 @@ function getSystemPrompt(
 
   return [
     `Flow Code — autonomous coding agent. ${pname} | ${cwd}`,
-    "Use tools to read/write/edit files, run commands, search web. Never output code blocks — use write_file. Never describe changes — make them.",
+    "Use ONLY these tools: read_file, write_file, edit_file, run_command, list_directory, search_web, fetch_url. Do NOT invent or call any other tool names.",
+    "Never output code blocks — use write_file. Never describe changes — make them with tools.",
     "Read files before editing. Write COMPLETE files. Install deps and start dev server to verify. Fix errors and retry.",
-    "Quality: semantic HTML, CSS custom properties, Tailwind, async/await, proper error handling. Production-grade code.",
+    "Quality: semantic HTML, CSS custom properties, Tailwind, async/await, proper error handling.",
     "Workflow: read → write → install → run → verify. Tell user the URL when done.",
   ].join("\n");
 }
@@ -1162,7 +1163,24 @@ async function streamWithTools(
       });
     } catch (err: unknown) {
       clearThinking();
-      throw err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // If model hallucinated a tool name, retry without tools to get text response
+      if (errMsg.includes("tool call validation") || errMsg.includes("not in request.tools")) {
+        try {
+          response = await client.chat.completions.create({
+            model,
+            messages: apiMessages,
+            temperature,
+            top_p: 0.95,
+            max_tokens: dynamicMaxTokens,
+            stream: false,
+          });
+        } catch (retryErr) {
+          throw retryErr;
+        }
+      } else {
+        throw err;
+      }
     }
     clearThinking();
 
@@ -1815,7 +1833,6 @@ async function run(
       saveSession(history, state.model, state.provider, state.intensity);
     } catch (err: unknown) {
       clearThinking();
-      // Roll back history to before the tool loop
       history.length = historyLenBefore;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("401") || msg.toLowerCase().includes("invalid")) {
@@ -1831,6 +1848,8 @@ async function run(
         console.error(a.yellow("  Rate limited. Wait a moment."));
       } else if (msg.includes("503")) {
         console.error(a.yellow("  Model overloaded. Try again."));
+      } else if (msg.includes("413") || msg.includes("too large")) {
+        console.error(a.yellow("  Request too large. Try a shorter message."));
       } else {
         console.error(a.red(`  ${msg}`));
       }
