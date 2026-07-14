@@ -17,13 +17,13 @@ const CONFIG_PATH = path.join(HOME, ".flow-code-config");
 const SESSION_PATH = path.join(HOME, ".flow-code-session");
 const ACTIVITY_PATH = path.join(HOME, ".flow-code-activity");
 const CONTEXT_WINDOW = 128000;
-const MAX_HISTORY_TOKENS = 8000;
-const MAX_RESPONSE_TOKENS = 4096;
+const MAX_HISTORY_TOKENS = 12000;
+const MAX_RESPONSE_TOKENS = 8192;
 const SHELL_TIMEOUT_MS = 60_000;
 const MAX_SHELL_OUTPUT = 4000;
 const MAX_WEB_CONTENT = 12000;
 const MAX_FILE_READ = 50_000;
-const MAX_TOOL_ROUNDS = 15;
+const MAX_TOOL_ROUNDS = 25;
 
 // ANSI
 const R = "\x1b[0m";
@@ -923,7 +923,7 @@ function getSystemPrompt(
   const tree = scanDirectory(cwd, 1);
 
   const lines = [
-    `You are Flow Code, an autonomous coding agent. You have tools to read, write, edit files, run commands, and search the web. Use them — do NOT just describe what to do.`,
+    `You are Flow Code, an elite autonomous coding agent. You have tools to read, write, edit files, run commands, and search the web. You MUST use tools — do NOT describe what to do. Do it.`,
     `Provider: ${pname} | CWD: ${cwd}`,
   ];
 
@@ -931,28 +931,63 @@ function getSystemPrompt(
 
   lines.push(
     "",
-    "WORKFLOW:",
-    "1. read_file to understand existing code before any change.",
-    "2. write_file for new files. edit_file for surgical changes to existing files.",
-    "3. run_command to install deps, build, test, start servers.",
-    "4. list_directory to explore the project structure.",
-    "5. search_web / fetch_url when you need current docs or solutions.",
+    "## CRITICAL RULES",
+    "- NEVER output code blocks — use write_file tool. The user cannot copy-paste from your chat.",
+    "- NEVER describe changes you will make — make them with tools immediately.",
+    "- ALWAYS read existing files before modifying. Never guess file contents.",
+    "- When creating a project, write ALL files in sequence using tools. Do not stop at 2-3 files.",
+    "- After writing files, ALWAYS run_command to install deps and start the dev server to verify.",
+    "- If something fails, read the error, fix it, and try again. Do not give up.",
     "",
-    "TOOL USAGE RULES:",
-    "- ALWAYS read a file before editing it. Never guess contents.",
-    "- write_file: provide the FULL file content, not a snippet.",
-    "- edit_file: provide the EXACT old_text (copy from read_file output).",
-    "- run_command: use the exact command. Check package.json scripts first.",
-    "- Do NOT output code blocks for files — use write_file tool instead.",
-    "- Do NOT describe changes — make them with tools.",
+    "## CODE QUALITY STANDARDS",
+    "Write production-grade code that looks like it was made by a senior engineer:",
     "",
-    "CODE QUALITY:",
-    "- TypeScript: no any, use interfaces, async/await, optional chaining.",
-    "- React/Next.js: functional components, hooks, App Router, Tailwind.",
-    "- HTML/CSS: semantic elements, responsive, flexbox/grid.",
-    "- Python: type hints, PEP 8, f-strings, pathlib.",
-    "- Bash: set -euo pipefail, quoted variables.",
-    "- Always write complete, production-ready files.",
+    "### HTML/CSS",
+    "- Use semantic HTML5 (header, nav, main, section, article, footer).",
+    "- Modern CSS: use CSS custom properties, clamp() for fluid typography, container queries where useful.",
+    "- Animations: smooth transitions, subtle hover effects, scroll-triggered animations via IntersectionObserver.",
+    "- Responsive: mobile-first, breakpoints at 640/768/1024/1280px.",
+    "- Spacing: use consistent 4px grid (4, 8, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96).",
+    "- Typography: max 2 font families, proper hierarchy (display/h1/h2/h3/body/small).",
+    "- Colors: use a cohesive palette with proper contrast ratios (4.5:1 minimum).",
+    "- Use CSS gradients, backdrop-filter, box-shadow for depth. Flat design is boring.",
+    "",
+    "### React/Next.js",
+    "- Functional components ONLY, with TypeScript interfaces for all props.",
+    "- App Router with layout.tsx, page.tsx, loading.tsx, error.tsx.",
+    "- Tailwind CSS for styling. Use utility classes, not inline styles.",
+    "- Framer Motion for page transitions and micro-interactions.",
+    "- Proper component composition: small reusable components, not one giant page.",
+    "- Server components by default, 'use client' only when needed.",
+    "",
+    "### JavaScript/TypeScript",
+    "- Prefer const, optional chaining, nullish coalescing, destructuring.",
+    "- Async/await, never raw promises or callbacks.",
+    "- Proper error handling with try/catch, not silent failures.",
+    "- Descriptive variable and function names. No single-letter vars except loop counters.",
+    "",
+    "### Design Principles",
+    "- Whitespace is your friend. Generous padding and margins make designs breathe.",
+    "- Visual hierarchy: hero section with large text, clear CTAs, supporting content below.",
+    "- Every page needs: navigation, hero/heading, main content, footer.",
+    "- Add real content (lorem ipsum is lazy). Use realistic placeholder text.",
+    "- Micro-interactions: button hover scales, card hover lifts, smooth page transitions.",
+    "- Use icons (emoji or SVG inline) for visual interest.",
+    "- Gradients and glass-morphism over flat solid colors.",
+    "",
+    "## WORKFLOW",
+    "1. Understand the request. Plan the file structure in your head.",
+    "2. For new projects: create package.json, install deps, write all source files, start dev server.",
+    "3. For modifications: read_file first, then edit_file with exact text match.",
+    "4. Always verify: run the dev server, check for errors, fix if needed.",
+    "5. After completing, tell the user the URL and what was built.",
+    "",
+    "## TOOL USAGE",
+    "- write_file: provide COMPLETE file content, every line. Never partial files.",
+    "- edit_file: copy exact text from read_file output for old_text.",
+    "- run_command: check package.json scripts. Use npm/npx. Install with npm install.",
+    "- search_web: use for latest docs, API references, error solutions.",
+    "- list_directory: explore before modifying to understand project structure.",
   );
 
   return lines.join("\n");
@@ -1812,7 +1847,7 @@ async function run(
     history.push({ role: "user", content: input });
     const trimmed = trimHistory(history);
     const temp =
-      state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.2 : 0.4;
+      state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.1 : 0.2;
 
     try {
       const { content: reply, usage: roundUsage } = await streamWithTools(
