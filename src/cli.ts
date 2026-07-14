@@ -653,131 +653,6 @@ function showTool(name: string, detail: string): void {
   console.log(a.dim(`  >> ${label}: ${truncate(detail, 60)}`));
 }
 
-function execTool(
-  name: string,
-  args: Record<string, unknown>
-): ToolResult {
-  const id = ""; // set by caller
-  const cwd = process.cwd();
-
-  switch (name) {
-    case "read_file": {
-      const fp = safePath(path.resolve(cwd, String(args.path || "")));
-      if (!fs.existsSync(fp)) {
-        return { tool_call_id: id, output: `File not found: ${args.path}`, error: true };
-      }
-      if (!isPathInside(fp, cwd) && !fp.startsWith(cwd)) {
-        return { tool_call_id: id, output: "Access denied: path outside workspace", error: true };
-      }
-      try {
-        const stat = fs.statSync(fp);
-        if (stat.size > MAX_FILE_READ) {
-          const content = fs.readFileSync(fp, "utf-8").slice(0, MAX_FILE_READ);
-          return { tool_call_id: id, output: content + "\n\n[TRUNCATED - file too large]" };
-        }
-        return { tool_call_id: id, output: fs.readFileSync(fp, "utf-8") };
-      } catch (err: unknown) {
-        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
-      }
-    }
-
-    case "write_file": {
-      const fp = safePath(path.resolve(cwd, String(args.path || "")));
-      if (!isInsideCwd(String(args.path || ""))) {
-        return { tool_call_id: id, output: "Access denied: can only write inside workspace", error: true };
-      }
-      const content = String(args.content || "");
-      if (!content) {
-        return { tool_call_id: id, output: "Error: content is empty", error: true };
-      }
-      try {
-        const dir = path.dirname(fp);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(fp, content, "utf-8");
-        const rel = path.relative(cwd, fp);
-        logActivity(`Wrote: ${rel}`);
-        return { tool_call_id: id, output: `File written: ${rel} (${content.length} chars)` };
-      } catch (err: unknown) {
-        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
-      }
-    }
-
-    case "edit_file": {
-      const fp = safePath(path.resolve(cwd, String(args.path || "")));
-      if (!isInsideCwd(String(args.path || ""))) {
-        return { tool_call_id: id, output: "Access denied: can only edit inside workspace", error: true };
-      }
-      if (!fs.existsSync(fp)) {
-        return { tool_call_id: id, output: `File not found: ${args.path}`, error: true };
-      }
-      const oldText = String(args.old_text || "");
-      const newText = String(args.new_text || "");
-      if (!oldText) {
-        return { tool_call_id: id, output: "Error: old_text is required", error: true };
-      }
-      try {
-        let content = fs.readFileSync(fp, "utf-8");
-        if (!content.includes(oldText)) {
-          return { tool_call_id: id, output: "Error: old_text not found in file. Use read_file to get exact text.", error: true };
-        }
-        content = content.replace(oldText, newText);
-        fs.writeFileSync(fp, content, "utf-8");
-        const rel = path.relative(cwd, fp);
-        logActivity(`Edited: ${rel}`);
-        return { tool_call_id: id, output: `File edited: ${rel}` };
-      } catch (err: unknown) {
-        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
-      }
-    }
-
-    case "run_command": {
-      const cmd = String(args.command || "");
-      if (!cmd) {
-        return { tool_call_id: id, output: "Error: command is empty", error: true };
-      }
-      // Return synchronously via spawn
-      try {
-        const child = spawn(cmd, [], {
-          cwd,
-          shell: true,
-          stdio: "pipe",
-          env: { ...process.env, FORCE_COLOR: "0" },
-        });
-        // This is sync but we need async — return placeholder
-        // Actually we need to handle this async in the tool loop
-        return { tool_call_id: id, output: `[RUNNING: ${cmd}]` };
-      } catch (err: unknown) {
-        return { tool_call_id: id, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
-      }
-    }
-
-    case "list_directory": {
-      const dir = args.path
-        ? safePath(path.resolve(cwd, String(args.path)))
-        : cwd;
-      const depth = typeof args.depth === "number" ? args.depth : 2;
-      if (!fs.existsSync(dir)) {
-        return { tool_call_id: id, output: `Directory not found: ${args.path}`, error: true };
-      }
-      const tree = scanDirectory(dir, depth);
-      return { tool_call_id: id, output: tree || "(empty directory)" };
-    }
-
-    case "search_web": {
-      // Handled async in tool loop
-      return { tool_call_id: id, output: `[SEARCHING: ${args.query}]` };
-    }
-
-    case "fetch_url": {
-      // Handled async in tool loop
-      return { tool_call_id: id, output: `[FETCHING: ${args.url}]` };
-    }
-
-    default:
-      return { tool_call_id: id, output: `Unknown tool: ${name}`, error: true };
-  }
-}
-
 async function execToolAsync(
   name: string,
   args: Record<string, unknown>,
@@ -786,9 +661,84 @@ async function execToolAsync(
   const cwd = process.cwd();
 
   switch (name) {
+    case "read_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      showTool("read_file", String(args.path || ""));
+      if (!fs.existsSync(fp)) {
+        return { tool_call_id: toolCallId, output: `File not found: ${args.path}`, error: true };
+      }
+      if (!isPathInside(fp, cwd) && !fp.startsWith(cwd)) {
+        return { tool_call_id: toolCallId, output: "Access denied: path outside workspace", error: true };
+      }
+      try {
+        const stat = fs.statSync(fp);
+        if (stat.size > MAX_FILE_READ) {
+          const content = fs.readFileSync(fp, "utf-8").slice(0, MAX_FILE_READ);
+          return { tool_call_id: toolCallId, output: content + "\n\n[TRUNCATED]" };
+        }
+        return { tool_call_id: toolCallId, output: fs.readFileSync(fp, "utf-8") };
+      } catch (err: unknown) {
+        return { tool_call_id: toolCallId, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "write_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      showTool("write_file", String(args.path || ""));
+      if (!isInsideCwd(String(args.path || ""))) {
+        return { tool_call_id: toolCallId, output: "Access denied: can only write inside workspace", error: true };
+      }
+      const content = String(args.content || "");
+      if (!content) {
+        return { tool_call_id: toolCallId, output: "Error: content is empty", error: true };
+      }
+      try {
+        const dir = path.dirname(fp);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(fp, content, "utf-8");
+        const rel = path.relative(cwd, fp);
+        logActivity(`Wrote: ${rel}`);
+        return { tool_call_id: toolCallId, output: `File written: ${rel} (${content.length} chars)` };
+      } catch (err: unknown) {
+        return { tool_call_id: toolCallId, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
+    case "edit_file": {
+      const fp = safePath(path.resolve(cwd, String(args.path || "")));
+      showTool("edit_file", String(args.path || ""));
+      if (!isInsideCwd(String(args.path || ""))) {
+        return { tool_call_id: toolCallId, output: "Access denied: can only edit inside workspace", error: true };
+      }
+      if (!fs.existsSync(fp)) {
+        return { tool_call_id: toolCallId, output: `File not found: ${args.path}`, error: true };
+      }
+      const oldText = String(args.old_text || "");
+      const newText = String(args.new_text || "");
+      if (!oldText) {
+        return { tool_call_id: toolCallId, output: "Error: old_text is required", error: true };
+      }
+      try {
+        let content = fs.readFileSync(fp, "utf-8");
+        if (!content.includes(oldText)) {
+          return { tool_call_id: toolCallId, output: "Error: old_text not found. Use read_file first.", error: true };
+        }
+        content = content.replace(oldText, newText);
+        fs.writeFileSync(fp, content, "utf-8");
+        const rel = path.relative(cwd, fp);
+        logActivity(`Edited: ${rel}`);
+        return { tool_call_id: toolCallId, output: `File edited: ${rel}` };
+      } catch (err: unknown) {
+        return { tool_call_id: toolCallId, output: `Error: ${err instanceof Error ? err.message : "unknown"}`, error: true };
+      }
+    }
+
     case "run_command": {
       const cmd = String(args.command || "");
       showTool("run_command", cmd);
+      if (!cmd) {
+        return { tool_call_id: toolCallId, output: "Error: command is empty", error: true };
+      }
       return new Promise((resolve) => {
         let stdout = "";
         let stderr = "";
@@ -832,6 +782,17 @@ async function execToolAsync(
       });
     }
 
+    case "list_directory": {
+      const dir = args.path ? safePath(path.resolve(cwd, String(args.path))) : cwd;
+      const depth = typeof args.depth === "number" ? args.depth : 2;
+      showTool("list_directory", String(args.path || cwd));
+      if (!fs.existsSync(dir)) {
+        return { tool_call_id: toolCallId, output: `Directory not found: ${args.path}`, error: true };
+      }
+      const tree = scanDirectory(dir, depth);
+      return { tool_call_id: toolCallId, output: tree || "(empty directory)" };
+    }
+
     case "search_web": {
       const query = String(args.query || "");
       showTool("search_web", query);
@@ -855,7 +816,7 @@ async function execToolAsync(
     }
 
     default:
-      return execTool(name, args);
+      return { tool_call_id: toolCallId, output: `Unknown tool: ${name}`, error: true };
   }
 }
 
@@ -942,7 +903,7 @@ function getSystemPrompt(
   const tree = scanDirectory(cwd, 1);
 
   const lines = [
-    `You are Flow Code, an autonomous coding agent running in a terminal. You have access to tools that let you read, write, and edit files, run commands, search the web, and fetch URLs.`,
+    `You are Flow Code, an autonomous coding agent. You have tools to read, write, edit files, run commands, and search the web. Use them — do NOT just describe what to do.`,
     `Provider: ${pname} | CWD: ${cwd}`,
   ];
 
@@ -950,33 +911,28 @@ function getSystemPrompt(
 
   lines.push(
     "",
-    "CAPABILITIES:",
-    "- read_file: Read any file to understand its contents",
-    "- write_file: Create or overwrite files (auto-creates directories)",
-    "- edit_file: Surgical find-and-replace edits on existing files",
-    "- run_command: Execute shell commands (build, test, git, npm, etc.)",
-    "- list_directory: Browse the file tree",
-    "- search_web: Search the web for current info, docs, solutions",
-    "- fetch_url: Fetch and read web pages (docs, Stack Overflow, GitHub)",
+    "WORKFLOW:",
+    "1. read_file to understand existing code before any change.",
+    "2. write_file for new files. edit_file for surgical changes to existing files.",
+    "3. run_command to install deps, build, test, start servers.",
+    "4. list_directory to explore the project structure.",
+    "5. search_web / fetch_url when you need current docs or solutions.",
     "",
-    "HOW TO WORK:",
-    "1. Understand the task. Read relevant files first.",
-    "2. Plan your approach mentally.",
-    "3. Use tools to implement changes.",
-    "4. Verify by running tests/builds.",
-    "5. Report what you did.",
+    "TOOL USAGE RULES:",
+    "- ALWAYS read a file before editing it. Never guess contents.",
+    "- write_file: provide the FULL file content, not a snippet.",
+    "- edit_file: provide the EXACT old_text (copy from read_file output).",
+    "- run_command: use the exact command. Check package.json scripts first.",
+    "- Do NOT output code blocks for files — use write_file tool instead.",
+    "- Do NOT describe changes — make them with tools.",
     "",
-    "RULES:",
-    "- Always read files before modifying them.",
-    "- Write complete, production-ready files.",
-    "- TypeScript: no any, use interfaces, async/await.",
-    "- React/Next.js: functional components, hooks, Tailwind.",
-    "- HTML/CSS: semantic, responsive, flexbox/grid.",
-    "- Python: type hints, PEP 8, f-strings.",
+    "CODE QUALITY:",
+    "- TypeScript: no any, use interfaces, async/await, optional chaining.",
+    "- React/Next.js: functional components, hooks, App Router, Tailwind.",
+    "- HTML/CSS: semantic elements, responsive, flexbox/grid.",
+    "- Python: type hints, PEP 8, f-strings, pathlib.",
     "- Bash: set -euo pipefail, quoted variables.",
-    "- Use edit_file for small changes, write_file for new files.",
-    "- When uncertain, search the web for current best practices.",
-    "- Never guess API signatures or library versions — always check.",
+    "- Always write complete, production-ready files.",
   );
 
   return lines.join("\n");
@@ -1122,9 +1078,7 @@ async function streamWithTools(
         // malformed args
       }
 
-      showTool(fnName, JSON.stringify(args).slice(0, 80));
-
-      // Execute async tools
+      // Execute tool (showTool is called inside execToolAsync)
       const result = await execToolAsync(fnName, args, tc.id);
 
       // Add tool result to messages
