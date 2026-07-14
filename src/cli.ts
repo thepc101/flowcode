@@ -17,8 +17,11 @@ const CONFIG_PATH = path.join(HOME, ".flow-code-config");
 const SESSION_PATH = path.join(HOME, ".flow-code-session");
 const ACTIVITY_PATH = path.join(HOME, ".flow-code-activity");
 const CONTEXT_WINDOW = 128000;
-const MAX_HISTORY_TOKENS = 4000;
-const MAX_RESPONSE_TOKENS = 4096;
+const MAX_HISTORY_TOKENS = 2000;
+const MAX_RESPONSE_TOKENS = 2048;
+const TOOL_DEFS_TOKENS = 1500;
+const SYSTEM_PROMPT_TOKENS = 200;
+const TPM_LIMIT = 6500;
 const SHELL_TIMEOUT_MS = 60_000;
 const MAX_SHELL_OUTPUT = 4000;
 const MAX_WEB_CONTENT = 12000;
@@ -989,6 +992,9 @@ function getSystemPrompt(
 function trimHistory(history: Message[]): Message[] {
   if (history.length === 0) return [];
 
+  // Account for system prompt + tool definitions + response budget
+  const availableForHistory = TPM_LIMIT - SYSTEM_PROMPT_TOKENS - TOOL_DEFS_TOKENS - 200;
+
   // Always include system prompt
   let sysIdx = -1;
   const systemMsg = history[0].role === "system" ? history[0] : null;
@@ -1006,15 +1012,13 @@ function trimHistory(history: Message[]): Message[] {
       // Walk back to find the assistant with tool_calls
       let j = i;
       while (j > sysIdx && history[j].role === "tool") j--;
-      // j is now the assistant message (or sysIdx)
       const group: Message[] = [];
       for (let k = j; k <= i; k++) {
         group.push(history[k]);
       }
       const groupTokens = group.reduce((sum, m) => sum + estimateTokens(getMessageContent(m)), 0);
-      if (total + groupTokens > MAX_HISTORY_TOKENS) break;
+      if (total + groupTokens > availableForHistory) break;
       total += groupTokens;
-      // Add group in forward order (collected is being built reversed)
       for (let k = group.length - 1; k >= 0; k--) {
         collected.push(group[k]);
       }
@@ -1029,7 +1033,7 @@ function trimHistory(history: Message[]): Message[] {
     }
 
     const tokens = estimateTokens(getMessageContent(msg));
-    if (total + tokens > MAX_HISTORY_TOKENS) break;
+    if (total + tokens > availableForHistory) break;
     total += tokens;
     collected.push(msg);
     i--;
@@ -1138,6 +1142,10 @@ async function streamWithTools(
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
 
+    // Dynamically cap response tokens to stay within TPM
+    const inputTokens = apiMessages.reduce((sum, m) => sum + estimateTokens(getMessageContent(m)), 0) + TOOL_DEFS_TOKENS + SYSTEM_PROMPT_TOKENS;
+    const dynamicMaxTokens = Math.min(MAX_RESPONSE_TOKENS, Math.max(512, TPM_LIMIT - inputTokens - 200));
+
     // Call API
     showThinking();
     let response: OpenAI.Chat.Completions.ChatCompletion;
@@ -1147,7 +1155,7 @@ async function streamWithTools(
         messages: apiMessages,
         temperature,
         top_p: 0.95,
-        max_tokens: MAX_RESPONSE_TOKENS,
+        max_tokens: dynamicMaxTokens,
         tools: TOOL_DEFINITIONS,
         tool_choice: "auto",
         stream: false,
