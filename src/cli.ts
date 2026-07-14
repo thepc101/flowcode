@@ -116,14 +116,14 @@ const PROVIDERS: Record<
   groq: {
     name: "Groq",
     baseURL: "https://api.groq.com/openai/v1",
-    defaultModel: "llama-3.3-70b-versatile",
-    modelFilter: /llama|mixtral|qwen|gemma|deepseek/i,
+    defaultModel: "openai/gpt-oss-120b",
+    modelFilter: /llama|mixtral|qwen|gemma|deepseek|gpt-oss/i,
   },
   cerebras: {
     name: "Cerebras",
     baseURL: "https://api.cerebras.ai/v1",
-    defaultModel: "llama-3.3-70b",
-    modelFilter: /llama|qwen/i,
+    defaultModel: "zai-glm-4.7",
+    modelFilter: /llama|qwen|glm|gpt-oss/i,
   },
 };
 
