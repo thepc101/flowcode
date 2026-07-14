@@ -51,7 +51,7 @@ const a = {
 
 type Intensity = "low" | "medium" | "high";
 type Provider = "groq" | "cerebras";
-type Role = "system" | "user" | "assistant";
+type Role = "system" | "user" | "assistant" | "tool";
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 interface Config {
@@ -84,7 +84,7 @@ interface ActivityEntry {
 }
 
 interface SessionData {
-  history: Array<{ role: string; content: string }>;
+  history: any[];
   model: string;
   provider: Provider;
   intensity: Intensity;
@@ -243,10 +243,12 @@ function saveSession(
 ): void {
   try {
     const data: SessionData = {
-      history: history.map((m) => ({
-        role: m.role,
-        content: getMessageContent(m),
-      })),
+      history: history.map((m) => {
+        const msg: any = { role: m.role, content: m.content || "" };
+        if ((m as any).tool_calls) msg.tool_calls = (m as any).tool_calls;
+        if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
+        return msg;
+      }),
       model,
       provider,
       intensity,
@@ -273,6 +275,24 @@ function loadSession(): SessionData | null {
         Array.isArray(data.history) &&
         typeof data.timestamp === "number"
       ) {
+        // Sanitize: remove orphaned tool messages (missing tool_call_id)
+        // and their preceding assistant messages with tool_calls
+        const clean: any[] = [];
+        let i = 0;
+        while (i < data.history.length) {
+          const msg = data.history[i];
+          if (msg.role === "tool" && !msg.tool_call_id) {
+            // Skip this broken tool message; also skip preceding assistant
+            if (clean.length > 0 && clean[clean.length - 1].role === "assistant" && clean[clean.length - 1].tool_calls) {
+              clean.pop();
+            }
+            i++;
+            continue;
+          }
+          clean.push(msg);
+          i++;
+        }
+        data.history = clean;
         return data as SessionData;
       }
     }
@@ -943,18 +963,58 @@ function getSystemPrompt(
 // ---------------------------------------------------------------------------
 
 function trimHistory(history: Message[]): Message[] {
-  let total = 0;
+  if (history.length === 0) return [];
+
   const result: Message[] = [];
-  if (history.length > 0 && history[0].role === "system") {
+
+  // Always include system prompt
+  let sysIdx = -1;
+  if (history[0].role === "system") {
     result.push(history[0]);
-    total += estimateTokens(getMessageContent(history[0]));
+    sysIdx = 0;
   }
-  for (let i = history.length - 1; i >= 1; i--) {
-    const tokens = estimateTokens(getMessageContent(history[i]));
+
+  // Walk backwards, keeping assistant+tool pairs intact
+  let total = sysIdx >= 0 ? estimateTokens(getMessageContent(history[0])) : 0;
+  let i = history.length - 1;
+
+  while (i > sysIdx) {
+    const msg = history[i];
+
+    // If this is a tool message, we need to also include all preceding tool messages
+    // and the assistant message that triggered them
+    if (msg.role === "tool") {
+      // Walk backwards to find the assistant message with tool_calls
+      let j = i;
+      while (j > sysIdx && history[j].role === "tool") j--;
+      // j is now the assistant message (or sysIdx)
+      // Include assistant + all tool messages as a group
+      const group: Message[] = [];
+      for (let k = j; k <= i; k++) {
+        group.push(history[k]);
+      }
+      const groupTokens = group.reduce((sum, m) => sum + estimateTokens(getMessageContent(m)), 0);
+      if (total + groupTokens > MAX_HISTORY_TOKENS) break;
+      total += groupTokens;
+      for (const m of group) result.splice(1, 0, m);
+      i = j - 1;
+      continue;
+    }
+
+    // If this is an assistant message with tool_calls, skip it
+    // (its tool responses should have been handled above)
+    if ((msg as any).tool_calls && (msg as any).tool_calls.length > 0) {
+      i--;
+      continue;
+    }
+
+    const tokens = estimateTokens(getMessageContent(msg));
     if (total + tokens > MAX_HISTORY_TOKENS) break;
     total += tokens;
-    result.splice(1, 0, history[i]);
+    result.splice(1, 0, msg);
+    i--;
   }
+
   return result;
 }
 
@@ -974,7 +1034,8 @@ function ask(question: string): Promise<string> {
 }
 
 function prompt(): string {
-  return a.cyan(`flow-code [${path.basename(process.cwd())}] > `);
+  const dir = path.basename(process.cwd());
+  return a.cyan(`[${dir}] > `);
 }
 
 async function readInput(): Promise<string> {
@@ -1029,6 +1090,22 @@ async function streamWithTools(
 ): Promise<{ content: string; usage: UsageInfo }> {
   let rounds = 0;
   let totalUsage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+  // Sanitize: ensure every tool message has a preceding assistant with matching tool_calls
+  const sanitized: Message[] = [];
+  for (const m of messages) {
+    if (m.role === "tool") {
+      const tm = m as any;
+      if (!tm.tool_call_id) continue;
+      // Verify the preceding message is an assistant with tool_calls
+      if (sanitized.length === 0 || sanitized[sanitized.length - 1].role !== "assistant") continue;
+      const prev = sanitized[sanitized.length - 1] as any;
+      if (!prev.tool_calls || !prev.tool_calls.some((tc: any) => tc.id === tm.tool_call_id)) continue;
+    }
+    sanitized.push(m);
+  }
+  messages.length = 0;
+  sanitized.forEach((m) => messages.push(m));
 
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
@@ -1108,32 +1185,12 @@ async function streamWithTools(
 // ---------------------------------------------------------------------------
 
 const FLOW_CODE_LOGO = [
-  "  ######  #######    ##    ##    ##       ######  ",
-  "  ##   ## ##    ##   ##    ##   ##        ##   ## ",
-  "  ######  #######   ##    ## ##           ######  ",
-  "  ##  ##  ##    ##  ##    ## ##           ##  ##  ",
-  "  ##   ## #######   ##    ##    ##       ##   ##  ",
-  "",
-  "  ######  #######   ##     ##  ######     ##      ",
-  "  ##   ## ##    ##  ##     ##  ##   ##    ## ##    ",
-  "  ######  #######   ##     ##  ######      ##     ",
-  "  ##  ##  ##    ##   ##   ##   ##  ##      ##      ",
-  "  ##   ## #######     #####    ##   ##    ## ##    ",
-];
-
-const MASCOT = [
-  "     .-\"\"\"\"\"-.",
-  "   .'          '.",
-  "  /   O      O   \\",
-  " |     .----.     |",
-  " |    /  ..  \\    |",
-  "  \\   \\  --  /   /",
-  "   '.  '----'  .'",
-  "     '-......-'",
-  "    /|        |\\",
-  "   / | Flow   | \\",
-  "  '  |  Code  |  '",
-  "    \\|        |/",
+  "  ███████╗██╗      ██████╗ ██╗    ██╗     ██████╗ ██████╗ ██████╗ ███████╗",
+  "  ██╔════╝██║     ██╔═══██╗██║    ██║    ██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+  "  █████╗  ██║     ██║   ██║██║ █╗ ██║    ██║     ██║   ██║██║  ██║█████╗  ",
+  "  ██╔══╝  ██║     ██║   ██║██║███╗██║    ██║     ██║   ██║██║  ██║██╔══╝  ",
+  "  ██║     ███████╗╚██████╔╝╚███╔███╔╝    ╚██████╗╚██████╔╝██████╔╝███████╗",
+  "  ╚═╝     ╚══════╝ ╚═════╝  ╚══╝╚══╝      ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1142,17 +1199,21 @@ const MASCOT = [
 
 function printBanner(): void {
   console.clear();
-  const ac = (t: string) => `${B}${CYN}${t}${R}`;
+  const mg = (t: string) => `${B}${MAG}${t}${R}`;
   const dm = (t: string) => `${D}${t}${R}`;
-  const sp = (t: string) => `${B}${MAG}${t}${R}`;
+
+  const W = 78;
+  const top = dm("\u2554" + "\u2550".repeat(W - 2) + "\u2557");
+  const bot = dm("\u255A" + "\u2550".repeat(W - 2) + "\u255D");
+  const side = dm("\u2551");
 
   console.log("");
+  console.log(top);
   for (const line of FLOW_CODE_LOGO) {
-    console.log(sp(line));
+    console.log(`${side}${mg(line)}${" ".repeat(W - 2 - line.length)}${side}`);
   }
-  console.log("");
-  console.log(`  ${dm("autonomous coding agent")}`);
-  console.log(`  ${dm("v" + VERSION)}`);
+  console.log(`${side}${dm("  v" + VERSION)}${" ".repeat(W - 2 - VERSION.length - 4)}${side}`);
+  console.log(bot);
   console.log("");
 }
 
@@ -1187,13 +1248,7 @@ function printDashboard(
   console.log(border);
   console.log(inner(`  ${bd(cy("Flow Code"))} ${dm("v" + VERSION)}`, `${bd(yl("Recent activity"))}`));
 
-  // Left side: mascot + info
-  // Right side: activity
   const leftLines: string[] = [];
-  leftLines.push("");
-  for (const ml of MASCOT) {
-    leftLines.push(`  ${mg(ml)}`);
-  }
   leftLines.push("");
   leftLines.push(`  ${dm(`${provider.name} ${dm("*")} ${model}`)}`);
   leftLines.push(`  ${dm(cwd)}`);
@@ -1367,7 +1422,10 @@ async function run(
     if (session) {
       history.length = 0;
       for (const msg of session.history) {
-        history.push({ role: msg.role as Role, content: msg.content });
+        const restored: any = { role: msg.role, content: msg.content || "" };
+        if (msg.tool_calls) restored.tool_calls = msg.tool_calls;
+        if (msg.tool_call_id) restored.tool_call_id = msg.tool_call_id;
+        history.push(restored);
       }
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
@@ -1376,7 +1434,8 @@ async function run(
       const count = history.filter(
         (m) => m.role === "user" || m.role === "assistant"
       ).length;
-      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`));
+      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.`));
+      console.log(a.dim(`  Directory: ${process.cwd()}\n`));
     }
   }
 
@@ -1435,14 +1494,18 @@ async function run(
       }
       history.length = 0;
       for (const msg of session.history) {
-        history.push({ role: msg.role as Role, content: msg.content });
+        const restored: any = { role: msg.role, content: msg.content || "" };
+        if (msg.tool_calls) restored.tool_calls = msg.tool_calls;
+        if (msg.tool_call_id) restored.tool_call_id = msg.tool_call_id;
+        history.push(restored);
       }
       if (session.cwd && fs.existsSync(session.cwd)) {
         process.chdir(session.cwd);
         updateSystem();
       }
       const count = history.filter((m) => m.role === "user" || m.role === "assistant").length;
-      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`));
+      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.`));
+      console.log(a.dim(`  Directory: ${process.cwd()}\n`));
       continue;
     }
 
