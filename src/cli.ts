@@ -1026,8 +1026,9 @@ async function streamWithTools(
   messages: Message[],
   temperature: number,
   history: Message[]
-): Promise<string> {
+): Promise<{ content: string; usage: UsageInfo }> {
   let rounds = 0;
+  let totalUsage: UsageInfo = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
@@ -1052,17 +1053,25 @@ async function streamWithTools(
     }
     clearThinking();
 
+    // Track usage
+    if (response.usage) {
+      totalUsage = {
+        promptTokens: response.usage.prompt_tokens,
+        completionTokens: response.usage.completion_tokens,
+        totalTokens: response.usage.total_tokens,
+      };
+    }
+
     const choice = response.choices[0];
     const msg = choice.message;
 
-    // If no tool calls, we're done — stream the text
+    // If no tool calls, we're done
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
       const content = msg.content || "";
       if (content) {
-        // Re-stream for display
         process.stdout.write(formatResponse(content) + "\n");
       }
-      return content;
+      return { content, usage: totalUsage };
     }
 
     // Process tool calls
@@ -1078,10 +1087,8 @@ async function streamWithTools(
         // malformed args
       }
 
-      // Execute tool (showTool is called inside execToolAsync)
       const result = await execToolAsync(fnName, args, tc.id);
 
-      // Add tool result to messages
       const toolMsg: Message = {
         role: "tool",
         tool_call_id: tc.id,
@@ -1090,13 +1097,44 @@ async function streamWithTools(
       messages.push(toolMsg);
       history.push(toolMsg);
     }
-
-    // Loop again — model may want to call more tools
   }
 
   console.log(a.yellow("  (max tool rounds reached)"));
-  return "";
+  return { content: "", usage: totalUsage };
 }
+
+// ---------------------------------------------------------------------------
+// ASCII Art Logo
+// ---------------------------------------------------------------------------
+
+const FLOW_CODE_LOGO = [
+  "  ######  #######    ##    ##    ##       ######  ",
+  "  ##   ## ##    ##   ##    ##   ##        ##   ## ",
+  "  ######  #######   ##    ## ##           ######  ",
+  "  ##  ##  ##    ##  ##    ## ##           ##  ##  ",
+  "  ##   ## #######   ##    ##    ##       ##   ##  ",
+  "",
+  "  ######  #######   ##     ##  ######     ##      ",
+  "  ##   ## ##    ##  ##     ##  ##   ##    ## ##    ",
+  "  ######  #######   ##     ##  ######      ##     ",
+  "  ##  ##  ##    ##   ##   ##   ##  ##      ##      ",
+  "  ##   ## #######     #####    ##   ##    ## ##    ",
+];
+
+const MASCOT = [
+  "     .-\"\"\"\"\"-.",
+  "   .'          '.",
+  "  /   O      O   \\",
+  " |     .----.     |",
+  " |    /  ..  \\    |",
+  "  \\   \\  --  /   /",
+  "   '.  '----'  .'",
+  "     '-......-'",
+  "    /|        |\\",
+  "   / | Flow   | \\",
+  "  '  |  Code  |  '",
+  "    \\|        |/",
+];
 
 // ---------------------------------------------------------------------------
 // Banner + Dashboard
@@ -1109,48 +1147,89 @@ function printBanner(): void {
   const sp = (t: string) => `${B}${MAG}${t}${R}`;
 
   console.log("");
-  console.log(`  ${sp("(*)")} ${ac("Flow Code")} ${dm("v" + VERSION)}`);
-  console.log(`       ${dm("autonomous coding agent")}`);
-  console.log(`       ${dm("-------------------------")}`);
+  for (const line of FLOW_CODE_LOGO) {
+    console.log(sp(line));
+  }
+  console.log("");
+  console.log(`  ${dm("autonomous coding agent")}`);
+  console.log(`  ${dm("v" + VERSION)}`);
   console.log("");
 }
 
-function printDashboard(config: Config): void {
+function printDashboard(
+  config: Config,
+  usage?: { totalTokens: number; totalCost: number }
+): void {
   console.clear();
   const provider = PROVIDERS[config.provider || "groq"];
   const model = config.defaultModel || provider.defaultModel;
   const cwd = process.cwd();
   const activity = getRecentActivity();
+
   const dm = (t: string) => `${D}${t}${R}`;
   const bd = (t: string) => `${B}${t}${R}`;
   const yl = (t: string) => `${YEL}${t}${R}`;
-  const w = 50;
-  const line = dm("-".repeat(w));
+  const cy = (t: string) => `${CYN}${t}${R}`;
+  const gr = (t: string) => `${GRN}${t}${R}`;
+  const mg = (t: string) => `${MAG}${t}${R}`;
+
+  const W = 62;
+  const border = dm("+" + "-".repeat(W - 2) + "+");
+  const inner = (left: string, right: string) => {
+    const l = left.padEnd(W / 2 - 2);
+    const r = right.padEnd(W / 2 - 2);
+    return `  ${dm("|")} ${l}${dm("|")} ${r}${dm("|")}`;
+  };
+  const row = (text: string) =>
+    `  ${dm("|")} ${text.padEnd(W - 4)} ${dm("|")}`;
 
   console.log("");
-  console.log(
-    `  ${dm("---")} ${bd(`${CYN}Flow Code${R}`)} ${dm(`v${VERSION} ${"-".repeat(w - 26)}`)}`
-  );
-  console.log(line);
-  console.log(`  ${dm(`${provider.name} | ${model}`)}`);
-  console.log(`  ${dm(cwd)}`);
-  console.log(`  ${dm("Tools: read, write, edit, run, list, search, fetch")}`);
+  console.log(border);
+  console.log(inner(`  ${bd(cy("Flow Code"))} ${dm("v" + VERSION)}`, `${bd(yl("Recent activity"))}`));
 
-  if (activity.length > 0) {
-    console.log("");
-    console.log(`  ${bd(yl("Recent"))}`);
-    for (const entry of activity) {
-      const ago = timeAgo(entry.time);
-      const action = truncate(entry.action, 38);
-      console.log(`  ${dm(ago.padEnd(10))} ${action}`);
-    }
+  // Left side: mascot + info
+  // Right side: activity
+  const leftLines: string[] = [];
+  leftLines.push("");
+  for (const ml of MASCOT) {
+    leftLines.push(`  ${mg(ml)}`);
+  }
+  leftLines.push("");
+  leftLines.push(`  ${dm(`${provider.name} ${dm("*")} ${model}`)}`);
+  leftLines.push(`  ${dm(cwd)}`);
+
+  if (usage && usage.totalTokens > 0) {
+    leftLines.push("");
+    leftLines.push(`  ${dm("Session:")} ${bd(String(usage.totalTokens.toLocaleString()))} tokens`);
+    leftLines.push(`  ${dm("Cost:")} ${gr("$" + usage.totalCost.toFixed(4))}`);
   }
 
-  console.log(line);
+  const rightLines: string[] = [];
+  if (activity.length > 0) {
+    for (const entry of activity.slice(0, 5)) {
+      const ago = timeAgo(entry.time).padEnd(8);
+      const action = truncate(entry.action, 30);
+      rightLines.push(`  ${dm(ago)} ${action}`);
+    }
+    if (activity.length > 5) {
+      rightLines.push(`  ${dm("...")} ${dm("/resume for more")}`);
+    }
+  } else {
+    rightLines.push(`  ${dm("No recent activity")}`);
+  }
+
+  const maxRows = Math.max(leftLines.length, rightLines.length);
+  for (let i = 0; i < maxRows; i++) {
+    const left = (leftLines[i] || "").padEnd(W / 2 - 2);
+    const right = (rightLines[i] || "").padEnd(W / 2 - 2);
+    console.log(`  ${dm("|")} ${left}${dm("|")} ${right}${dm("|")}`);
+  }
+
+  console.log(border);
+  console.log("");
   console.log(
     `  ${dm("/cmds")} commands  ${dm("/help")} help  ${dm("exit")} quit`
   );
-  console.log(line);
   console.log("");
 }
 
@@ -1240,6 +1319,19 @@ async function setup(): Promise<{
   console.log(a.dim(`  ${PROVIDERS[provider].name} | ${model} | ${intensity.toUpperCase()}`));
   console.log("");
 
+  // Offer to resume after setup
+  if (hasSavedSession()) {
+    const session = loadSession();
+    if (session) {
+      console.log(a.dim(`  Last session: ${timeAgo(session.timestamp)}`));
+      const resume = await ask(a.bold("  Resume last conversation? (y/N): "));
+      if (resume.toLowerCase() === "y" || resume.toLowerCase() === "yes") {
+        // Will be handled in main after setup returns
+        return { client, model, intensity, provider };
+      }
+    }
+  }
+
   return { client, model, intensity, provider };
 }
 
@@ -1251,12 +1343,16 @@ async function run(
   client: OpenAI,
   model: string,
   intensity: Intensity,
-  provider: Provider
+  provider: Provider,
+  resume: boolean = false
 ): Promise<void> {
   const state: SessionState = { client, model, intensity, provider };
   const history: Message[] = [
     { role: "system", content: getSystemPrompt(state.intensity, process.cwd(), state.provider) },
   ];
+
+  // Session-level usage tracking
+  const usage = { totalTokens: 0, totalCost: 0 };
 
   const updateSystem = (): void => {
     history[0] = {
@@ -1264,6 +1360,25 @@ async function run(
       content: getSystemPrompt(state.intensity, process.cwd(), state.provider),
     };
   };
+
+  // Restore session if resuming
+  if (resume) {
+    const session = loadSession();
+    if (session) {
+      history.length = 0;
+      for (const msg of session.history) {
+        history.push({ role: msg.role as Role, content: msg.content });
+      }
+      if (session.cwd && fs.existsSync(session.cwd)) {
+        process.chdir(session.cwd);
+        updateSystem();
+      }
+      const count = history.filter(
+        (m) => m.role === "user" || m.role === "assistant"
+      ).length;
+      console.log(a.green(`  Resumed ${count} messages from ${timeAgo(session.timestamp)}.\n`));
+    }
+  }
 
   while (true) {
     const input = await readInput();
@@ -1637,13 +1752,21 @@ async function run(
       state.intensity === "low" ? 0.0 : state.intensity === "medium" ? 0.2 : 0.4;
 
     try {
-      const reply = await streamWithTools(
+      const { content: reply, usage: roundUsage } = await streamWithTools(
         state.client,
         state.model,
-        [...trimmed], // don't mutate trimmed
+        [...trimmed],
         temp,
         history
       );
+
+      // Track session usage
+      if (roundUsage.totalTokens > 0) {
+        usage.totalTokens += roundUsage.totalTokens;
+        // Rough cost estimate for Groq free tier
+        usage.totalCost += roundUsage.totalTokens * 0.000001;
+        printUsage(roundUsage, history);
+      }
 
       if (reply) {
         history.push({ role: "assistant", content: reply });
@@ -1697,6 +1820,7 @@ function main(): void {
 
   setup()
     .then(async ({ client, model, intensity, provider }) => {
+      // Ask for project directory
       console.log(a.dim(`  Working directory: ${process.cwd()}`));
       const dirInput = await ask(a.bold("  Project directory (Enter to skip): "));
       if (dirInput.trim()) {
@@ -1709,19 +1833,31 @@ function main(): void {
         }
       }
 
-      const config = loadConfig();
-      printDashboard(config);
-
+      // Check for saved session and offer resume
+      let resumedSession = false;
       if (hasSavedSession()) {
         const session = loadSession();
         if (session) {
-          console.log(a.dim(`  Last session: ${timeAgo(session.timestamp)} -- type /resume`));
+          const resume = await ask(
+            a.bold(`  Resume ${timeAgo(session.timestamp)} session? (y/N): `)
+          );
+          if (resume.toLowerCase() === "y" || resume.toLowerCase() === "yes") {
+            resumedSession = true;
+          }
         }
       }
-      console.log(a.green("  Ready! Describe what you want to build.\n"));
 
+      const config = loadConfig();
+      const usage = { totalTokens: 0, totalCost: 0 };
+      printDashboard(config, usage);
+
+      if (resumedSession) {
+        return run(client, model, intensity, provider, true);
+      }
+
+      console.log(a.green("  Ready! Describe what you want to build.\n"));
       logActivity("Started session");
-      return run(client, model, intensity, provider);
+      return run(client, model, intensity, provider, false);
     })
     .catch((err) => {
       console.error(a.red(`\n  Fatal: ${err.message || err}`));
